@@ -168,7 +168,7 @@ function App() {
         <p>Scan this QR code with your phone camera to open the live parking dashboard.</p>
         <div style={{ display: "inline-block", padding: "12px", background: "white", borderRadius: "12px" }}>
           <QRCodeSVG
-            value="http://10.78.51.208:5175"
+            value="https://smartparking-39mz.onrender.com"
             size={220}
             level="H"
             includeMargin={true}
