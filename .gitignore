@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+backend/venv/
+
+# Environment and sensitive keys
+.env
+.env.*
+!.env.example
+
+# Build outputs
+dist/
+build/
+.pytest_cache/
+__pycache__/
+*.pyc
+
+# Local databases & logs
+*.db
+*.sqlite3
+*.log
+backend/smartparking.db
+
+# OS Files
+.DS_Store
+Thumbs.db

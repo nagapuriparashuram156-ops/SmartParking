@@ -1,236 +1,373 @@
-
-from fastapi import FastAPI, HTTPException
+import os
+from typing import Optional
+from fastapi import FastAPI, HTTPException, Header, Depends, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime, timedelta
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from database import db, get_current_time
 
-app = FastAPI(title="Smart Parking API")
+from contextlib import asynccontextmanager
 
-# CORS: allow deployed Render frontend and local development
+# Lifespan: Initialize Database Tables and Seeds
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        db.init_db()
+        print("[DATABASE] Initialized successfully.")
+    except Exception as e:
+        print(f"[DATABASE ERROR] Initialization failed: {e}")
+    yield
+
+app = FastAPI(
+    title="Smart Parking System API",
+    description="Full-stack IoT Smart Parking backend with ESP32 integration, MySQL persistence, and real-time dashboard state.",
+    version="2.0.0",
+    lifespan=lifespan,
+)
+
+# Configurable Sensor API Token for ESP32 authentication
+SENSOR_API_TOKEN = os.getenv("SENSOR_API_TOKEN", "smartpark_esp32_secret_2026")
+
+# CORS Configuration
+frontend_env = os.getenv("FRONTEND_ORIGINS", "")
+allowed_origins = [
+    "https://smartparking-mobile.onrender.com",
+    "https://smartparking-39mz.onrender.com",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
+if frontend_env:
+    for origin in frontend_env.split(","):
+        clean = origin.strip()
+        if clean and clean not in allowed_origins:
+            allowed_origins.append(clean)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://smartparking-39mz.onrender.com",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
-    allow_origin_regex=r"https://.*\.onrender\.com",
-    allow_credentials=False,
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"^https://.*\.onrender\.com$",
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Three parking slots
-slots = {
-    i: {
-        "id": i,
-        "status": "Available",
-        "date": None,
-        "start_time": None,
-        "end_time": None,
-        "duration_minutes": None,
-    }
-    for i in range(1, 4)
-}
 
-# In-memory booking storage
-bookings = {1: [], 2: [], 3: []}
-
-# Separate sensor states from booking states
-sensor_states = {1: "Empty", 2: "Empty", 3: "Empty"}
-
-BUFFER_MINUTES = 1
+# Pydantic Schemas
+class SensorUpdateRequest(BaseModel):
+    slot_id: int = Field(..., ge=1, le=3, description="Parking slot ID (1, 2, or 3)")
+    status: str = Field(..., description="Sensor physical state: 'Occupied', 'Empty', or 'Error'")
+    distance_cm: Optional[float] = Field(None, description="Ultrasonic distance in centimeters")
 
 
-def parse_booking(date_str, time_str, duration):
-    try:
-        start = datetime.strptime(
-            f"{date_str} {time_str}",
-            "%Y-%m-%d %H:%M"
-        )
-    except ValueError:
+class BookingCreateRequest(BaseModel):
+    date: Optional[str] = Field(None, description="Booking date YYYY-MM-DD")
+    start_time: Optional[str] = Field(None, description="Start time HH:MM")
+    duration_minutes: Optional[int] = Field(60, ge=1, le=1440, description="Duration in minutes (1 - 1440)")
+
+
+class CancelSlotRequest(BaseModel):
+    booking_id: Optional[str] = None
+    date: Optional[str] = None
+    time: Optional[str] = None
+
+
+
+# Dependency: Verify Hardware Sensor Token
+def verify_sensor_token(
+    request: Request,
+    x_sensor_token: Optional[str] = Header(None, alias="X-Sensor-Token"),
+    token: Optional[str] = Query(None)
+):
+    auth_header = request.headers.get("Authorization", "")
+    bearer_token = None
+    if auth_header.startswith("Bearer "):
+        bearer_token = auth_header.split("Bearer ")[1].strip()
+
+    provided_token = x_sensor_token or bearer_token or token
+
+    # Check secret token
+    if not provided_token or provided_token != SENSOR_API_TOKEN:
         raise HTTPException(
-            status_code=400,
-            detail="Invalid date or time. Use YYYY-MM-DD and HH:MM."
+            status_code=401,
+            detail="Unauthorized: Invalid or missing sensor authentication token."
         )
-
-    if duration < 1 or duration > 1440:
-        raise HTTPException(
-            status_code=400,
-            detail="Duration must be between 1 and 1440 minutes."
-        )
-
-    end = start + timedelta(minutes=duration)
-    return start, end
+    return True
 
 
-def booking_to_response(booking):
-    return {
-        "slot_id": booking["slot_id"],
-        "date": booking["date"],
-        "start_time": booking["start"].strftime("%H:%M"),
-        "end_time": booking["end"].strftime("%H:%M"),
-        "duration_minutes": booking["duration_minutes"],
-    }
-
-
-def get_slot_data(slot_id):
-    slot_bookings = bookings[slot_id]
-
-    # Show the latest booking details if bookings exist
-    latest = slot_bookings[-1] if slot_bookings else None
-
-    # Sensor status takes priority for physical occupancy
-    if sensor_states[slot_id] == "Occupied":
-        status = "Occupied"
-    else:
-        # Booking availability is time-based, not permanently Booked
-        status = "Available"
-
-    return {
-        "id": slot_id,
-        "status": status,
-        "date": latest["date"] if latest else None,
-        "start_time": latest["start"].strftime("%H:%M") if latest else None,
-        "end_time": latest["end"].strftime("%H:%M") if latest else None,
-        "duration_minutes": latest["duration_minutes"] if latest else None,
-    }
-
+# ====================================================================
+# API Endpoints
+# ====================================================================
 
 @app.get("/")
 def home():
-    return {"message": "Smart Parking API is running"}
+    now = get_current_time()
+    return {
+        "system": "Smart Parking System",
+        "status": "Online",
+        "version": "2.0.0",
+        "time": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "timezone": "Asia/Kolkata",
+        "endpoints": {
+            "health": "/health",
+            "slots": "/slots",
+            "sensor_status": "/sensor/status",
+            "sensor_update": "POST /sensor/update",
+            "bookings": "/bookings",
+            "book_slot": "POST /book/{slot_id}",
+            "cancel_booking": "DELETE /bookings/{booking_id}",
+            "cancel_slot": "POST /cancel/{slot_id}",
+        }
+    }
+
+
+@app.get("/health")
+def health_check():
+    """System health check endpoint for monitoring, Docker, and Render."""
+    now = get_current_time()
+    db_ok = False
+    db_type = "unknown"
+    error_msg = None
+
+    try:
+        conn, db_type = db.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1;")
+        cursor.fetchone()
+        cursor.close()
+        conn.close()
+        db_ok = True
+    except Exception as e:
+        error_msg = str(e)
+
+    status_code = 200 if db_ok else 503
+    response_payload = {
+        "status": "healthy" if db_ok else "unhealthy",
+        "database": {
+            "connected": db_ok,
+            "engine": db_type,
+            "error": error_msg,
+        },
+        "server_time": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "timezone": "Asia/Kolkata",
+    }
+    if not db_ok:
+        raise HTTPException(status_code=status_code, detail=response_payload)
+    return response_payload
 
 
 @app.get("/slots")
 def get_slots():
-    return {"slots": [get_slot_data(i) for i in range(1, 4)]}
+    """
+    Returns real-time slot states, physical sensor data, active bookings,
+    and accurate dashboard counts.
+    """
+    try:
+        return db.get_slots_with_status()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error fetching slots: {str(e)}")
+
+
+@app.get("/sensor/status")
+def get_sensor_status():
+    """Hardware sensor status for all 3 slots."""
+    try:
+        sensor_list = db.get_all_sensor_status()
+        return {
+            "slots": sensor_list,
+            "server_time": get_current_time().strftime("%Y-%m-%d %H:%M:%S"),
+            "timezone": "Asia/Kolkata",
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error fetching sensor status: {str(e)}")
+
+
+@app.post("/sensor/update")
+def update_sensor_status(
+    data: SensorUpdateRequest,
+    _authorized: bool = Depends(verify_sensor_token)
+):
+    """
+    Receives physical ultrasonic sensor telemetry from ESP32.
+    Requires X-Sensor-Token header.
+    Normalizes statuses into 'Occupied', 'Empty', or 'Error'.
+    """
+    raw_status = data.status.strip().lower()
+
+    if raw_status in ("occupied", "full", "vehicle", "vehicle_detected", "present", "1"):
+        normalized_status = "Occupied"
+    elif raw_status in ("empty", "available", "vacant", "no_vehicle", "clear", "0"):
+        normalized_status = "Empty"
+    elif raw_status in ("error", "sensor_error", "timeout", "unknown", "disconnected", "-1"):
+        normalized_status = "Error"
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid status. Valid values: 'Occupied', 'Empty', 'Error'."
+        )
+
+    # Sanity check on distance readings
+    dist = data.distance_cm
+    if dist is not None:
+        if dist < 0 or dist > 500:
+            normalized_status = "Error"
+
+    try:
+        db.update_sensor_status(data.slot_id, normalized_status, dist)
+        slot_info = db.get_slots_with_status()
+        updated_slot = next((s for s in slot_info["slots"] if s["id"] == data.slot_id), None)
+        return {
+            "message": f"Sensor update recorded for Slot {data.slot_id}.",
+            "slot_id": data.slot_id,
+            "physical_status": normalized_status,
+            "distance_cm": dist,
+            "slot": updated_slot,
+            "summary": slot_info["summary"],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to record sensor update: {str(e)}")
 
 
 @app.post("/book/{slot_id}")
 def book_slot(
     slot_id: int,
-    date: str,
-    start_time: str,
-    duration_minutes: int = 60
+    # Support both JSON body and URL query params
+    body: Optional[BookingCreateRequest] = None,
+    date: Optional[str] = Query(None),
+    start_time: Optional[str] = Query(None),
+    duration_minutes: Optional[int] = Query(None),
 ):
-    if slot_id not in slots:
-        raise HTTPException(status_code=404, detail="Invalid parking slot.")
+    """
+    Reserves a parking slot with strict 1-minute buffer and conflict checks.
+    Accepts date, start_time, and duration_minutes via query parameters or JSON body.
+    """
+    if slot_id not in (1, 2, 3):
+        raise HTTPException(status_code=404, detail=f"Slot {slot_id} does not exist. Available slots: 1, 2, 3.")
 
-    if sensor_states[slot_id] == "Occupied":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Slot {slot_id} is currently occupied by a vehicle."
+    # Merge body and query params
+    req_date = (body and body.date) or date
+    req_start_time = (body and body.start_time) or start_time
+    req_duration = (body and body.duration_minutes) or duration_minutes or 60
+
+    if not req_date or not req_start_time:
+        raise HTTPException(status_code=400, detail="Missing required booking parameters: 'date' (YYYY-MM-DD) and 'start_time' (HH:MM).")
+
+    try:
+        booking_result = db.create_booking(
+            slot_id=slot_id,
+            date_str=req_date,
+            start_time_str=req_start_time,
+            duration_minutes=req_duration,
         )
 
-    start, end = parse_booking(date, start_time, duration_minutes)
+        slot_state = db.get_slots_with_status()
+        current_slot = next((s for s in slot_state["slots"] if s["id"] == slot_id), None)
 
-    # Check conflicts including one-minute buffer
-    for existing in bookings[slot_id]:
-        existing_start = existing["start"]
-        existing_end = existing["end"]
+        return {
+            "message": f"Booking confirmed successfully for Slot {slot_id}!",
+            "booking": booking_result,
+            "slot": current_slot,
+            "summary": slot_state["summary"],
+        }
+    except ValueError as ve:
+        raise HTTPException(status_code=409, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal error processing booking: {str(e)}")
 
-        buffered_start = existing_start - timedelta(minutes=BUFFER_MINUTES)
-        buffered_end = existing_end + timedelta(minutes=BUFFER_MINUTES)
 
-        if start < buffered_end and end > buffered_start:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"Slot {slot_id} is unavailable during this time. "
-                    f"Existing booking: {existing['date']} "
-                    f"{existing_start.strftime('%H:%M')}–"
-                    f"{existing_end.strftime('%H:%M')}. "
-                    "Choose another time."
-                )
-            )
+@app.get("/bookings")
+def list_bookings(
+    slot_id: Optional[int] = Query(None, ge=1, le=3),
+    status: Optional[str] = Query(None),
+):
+    """Lists all reservations with optional filters."""
+    try:
+        bookings = db.get_bookings(slot_id=slot_id, status=status)
+        return {
+            "total_bookings": len(bookings),
+            "bookings": bookings,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error fetching bookings: {str(e)}")
 
-    booking = {
-        "slot_id": slot_id,
-        "date": start.strftime("%Y-%m-%d"),
-        "start": start,
-        "end": end,
-        "duration_minutes": duration_minutes,
-    }
 
-    bookings[slot_id].append(booking)
+@app.get("/bookings/{booking_id}")
+def get_booking(booking_id: str):
+    """Fetches details of a specific reservation by booking ID."""
+    try:
+        booking = db.get_booking_by_id(booking_id)
+        if not booking:
+            raise HTTPException(status_code=404, detail=f"Booking '{booking_id}' not found.")
+        return booking
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error fetching booking: {str(e)}")
 
-    return {
-        "message": "Booking confirmed successfully!",
-        "slot": get_slot_data(slot_id),
-        "booking": booking_to_response(booking),
-    }
+
+@app.delete("/bookings/{booking_id}")
+def delete_booking(booking_id: str):
+    """Cancels a reservation using its unique booking ID."""
+    try:
+        result = db.cancel_booking(booking_id)
+        if not result:
+            raise HTTPException(status_code=404, detail=f"Booking '{booking_id}' not found.")
+
+        slot_state = db.get_slots_with_status()
+        return {
+            "message": f"Booking '{booking_id}' cancelled successfully.",
+            "booking": result,
+            "summary": slot_state["summary"],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error cancelling booking: {str(e)}")
 
 
 @app.post("/cancel/{slot_id}")
-def cancel_booking(
+def cancel_slot(
     slot_id: int,
-    date: str,
-    time: str
+    body: Optional[CancelSlotRequest] = None,
+    booking_id: Optional[str] = Query(None),
+    date: Optional[str] = Query(None),
+    time: Optional[str] = Query(None),
 ):
-    if slot_id not in slots:
+    """
+    Cancels reservation on a slot by booking_id or date/time query parameters.
+    Maintains backward compatibility with legacy frontend queries while supporting ID.
+    """
+    if slot_id not in (1, 2, 3):
         raise HTTPException(status_code=404, detail="Invalid parking slot.")
 
-    slot_bookings = bookings[slot_id]
+    target_booking_id = (body and body.booking_id) or booking_id
+    target_date = (body and body.date) or date
+    target_time = (body and body.time) or time
 
-    for index, booking in enumerate(slot_bookings):
-        if (
-            booking["date"] == date
-            and booking["start"].strftime("%H:%M") == time
-        ):
-            slot_bookings.pop(index)
-
-            return {
-                "message": f"Booking for Slot {slot_id} cancelled successfully.",
-                "slot": get_slot_data(slot_id),
-            }
-
-    raise HTTPException(
-        status_code=404,
-        detail="Matching booking was not found."
-    )
-
-
-# Sensor API
-class SensorUpdate(BaseModel):
-    slot_id: int
-    status: str
-
-
-@app.get("/sensor/status")
-def get_sensor_status():
-    return {
-        "slots": [
-            {
-                "id": slot_id,
-                "status": sensor_states[slot_id],
-                "updated_at": None,
-            }
-            for slot_id in range(1, 4)
-        ]
-    }
-
-
-@app.post("/sensor/update")
-def update_sensor_status(data: SensorUpdate):
-    if data.slot_id not in slots:
-        raise HTTPException(status_code=404, detail="Invalid slot ID.")
-
-    value = data.status.strip().lower()
-
-    if value in ("occupied", "full", "vehicle", "vehicle_detected"):
-        sensor_states[data.slot_id] = "Occupied"
-
-    elif value in ("empty", "available", "vacant", "no_vehicle"):
-        sensor_states[data.slot_id] = "Empty"
-
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="Status must be Empty/Available or Occupied."
+    try:
+        result = db.cancel_slot_booking(
+            slot_id=slot_id,
+            date=target_date,
+            time=target_time,
+            booking_id=target_booking_id,
         )
 
-    return {
-        "message": "Sensor status updated.",
-        "slot": get_slot_data(data.slot_id),
-    }
+        if not result:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No matching active reservation found for Slot {slot_id}."
+            )
+
+        slot_state = db.get_slots_with_status()
+        current_slot = next((s for s in slot_state["slots"] if s["id"] == slot_id), None)
+
+        return {
+            "message": f"Booking for Slot {slot_id} cancelled successfully.",
+            "booking": result,
+            "slot": current_slot,
+            "summary": slot_state["summary"],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error cancelling booking: {str(e)}")

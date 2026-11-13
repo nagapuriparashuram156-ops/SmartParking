@@ -1,0 +1,48 @@
+services:
+  # -------------------------------------------------------------------
+  # 1. FastAPI Backend Web Service
+  # -------------------------------------------------------------------
+  - type: web
+    name: smartparking-backend
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.11
+      - key: SENSOR_API_TOKEN
+        value: smartpark_esp32_secret_2026
+      - key: FRONTEND_ORIGINS
+        value: https://smartparking-mobile.onrender.com,https://smartparking-39mz.onrender.com
+      - key: MYSQL_HOST
+        sync: false # Set in Render Dashboard from your MySQL provider (e.g. Aiven, TiDB, Clever Cloud)
+      - key: MYSQL_PORT
+        value: 3306
+      - key: MYSQL_USER
+        sync: false
+      - key: MYSQL_PASSWORD
+        sync: false
+      - key: MYSQL_DATABASE
+        value: smartparking
+
+  # -------------------------------------------------------------------
+  # 2. React + Vite Frontend Static Site
+  # -------------------------------------------------------------------
+  - type: web
+    name: smartparking-mobile
+    runtime: static
+    plan: free
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_API_URL
+        value: https://smartparking-backend-4ivz.onrender.com
+      - key: VITE_WEBSITE_URL
+        value: https://smartparking-mobile.onrender.com
