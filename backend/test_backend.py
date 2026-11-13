@@ -109,6 +109,12 @@ def test_booking_buffer_and_conflict_logic():
     booking_id = book_res["booking"]["booking_id"]
     assert booking_id.startswith("BK-")
 
+    # Verify that Slot 2 updates immediately to Reserved and dashboard counter updates
+    slots_after_book = get_slots()
+    assert slots_after_book["slots"][1]["status"] == "Reserved"
+    assert slots_after_book["summary"]["booked_reserved"] >= 1
+    assert slots_after_book["summary"]["available_now"] <= 2
+
     # 2. Conflict: Overlapping reservation on Slot 2
     overlap_time = (start_time + timedelta(minutes=10)).strftime("%H:%M")
     with pytest.raises(HTTPException) as exc_overlap:

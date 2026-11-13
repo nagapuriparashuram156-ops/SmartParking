@@ -595,27 +595,29 @@ class DatabaseManager:
                 # Compute effective slot status:
                 # Priority:
                 # 1. Physically Occupied: Sensor detects vehicle -> 'Occupied'
-                # 2. Active Reservation: Reserved right now -> 'Reserved'
+                # 2. Reservation: Has active reservation now or confirmed upcoming reservation -> 'Reserved'
                 # 3. Sensor Error: Sensor hardware error or unknown -> 'Sensor Error'
                 # 4. Otherwise -> 'Available'
+                has_reservation = (active_booking is not None) or (next_booking is not None)
+
                 if phys_status == "Occupied":
                     effective_status = "Occupied"
-                elif active_booking is not None:
+                elif has_reservation:
                     effective_status = "Reserved"
                 elif phys_status in ("Error", "Unknown"):
                     effective_status = "Sensor Error"
                 else:
                     effective_status = "Available"
 
-                # Pick latest or active booking for display
-                display_booking = active_booking or (slot_b_list[-1] if slot_b_list else None)
+                # Pick active or upcoming or latest booking for display
+                display_booking = active_booking or next_booking or (slot_b_list[-1] if slot_b_list else None)
 
                 computed_slots.append({
                     "id": slot_id,
                     "slot_number": s["slot_number"],
                     "status": effective_status,
                     "physical_status": phys_status,
-                    "reservation_status": "Reserved" if active_booking else "None",
+                    "reservation_status": "Active Reservation" if active_booking else ("Upcoming Reservation" if next_booking else "None"),
                     "distance_cm": dist,
                     "last_sensor_update": heartbeat,
                     "is_sensor_healthy": bool(s.get("is_healthy", 1)),
@@ -631,6 +633,7 @@ class DatabaseManager:
                         "date": str(next_booking["booking_date"]),
                         "start_time": str(next_booking["start_time"])[:5],
                         "end_time": str(next_booking["end_time"])[:5],
+                        "duration_minutes": next_booking.get("duration_minutes", 60),
                     } if next_booking else None,
                     # Backward compatibility fields for existing frontend expectations
                     "date": str(display_booking["booking_date"]) if display_booking else None,
@@ -643,7 +646,7 @@ class DatabaseManager:
             # Calculate accurate dashboard summary counts
             total_slots = len(computed_slots)
             physically_occupied = sum(1 for s in computed_slots if s["physical_status"] == "Occupied")
-            booked_reserved = sum(1 for s in computed_slots if s["active_booking"] is not None)
+            booked_reserved = sum(1 for s in computed_slots if s["status"] == "Reserved")
             sensor_errors = sum(1 for s in computed_slots if s["physical_status"] in ("Error", "Unknown"))
             available_now = sum(1 for s in computed_slots if s["status"] == "Available")
 

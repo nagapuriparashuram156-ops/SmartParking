@@ -256,7 +256,7 @@ function App() {
         <div className="kpi-card kpi-green">
           <div className="kpi-label">Available Now</div>
           <div className="kpi-value">{summary.available_now}</div>
-          <div className="kpi-subtext">No vehicle & no active reservation</div>
+          <div className="kpi-subtext">No vehicle & no reservation</div>
         </div>
 
         <div className="kpi-card kpi-red">
@@ -268,7 +268,7 @@ function App() {
         <div className="kpi-card kpi-orange">
           <div className="kpi-label">Booked / Reserved</div>
           <div className="kpi-value">{summary.booked_reserved}</div>
-          <div className="kpi-subtext">Active reservation right now</div>
+          <div className="kpi-subtext">Active or upcoming reservation</div>
         </div>
 
         <div className="kpi-card kpi-gray">
@@ -301,12 +301,16 @@ function App() {
               statusBadge = "Physically Occupied";
             } else if (isReserved) {
               cardTheme = "theme-reserved";
-              statusBadge = "Reserved / Booked";
+              statusBadge = slot.active_booking
+                ? "Active Reservation"
+                : `Reserved for ${slot.next_booking?.start_time || "Later"}`;
             } else if (isError) {
               cardTheme = "theme-error";
               statusBadge = "Sensor Error";
               carIcon = "⚠️";
             }
+
+            const currentBooking = slot.active_booking || slot.next_booking;
 
             return (
               <div key={slot.id} className={`slot-card ${cardTheme}`}>
@@ -353,8 +357,9 @@ function App() {
                   ) : slot.next_booking ? (
                     <div className="upcoming-booking-info">
                       <div className="booking-tag next-tag">Upcoming Reservation</div>
+                      <p className="b-line"><strong>ID:</strong> {slot.next_booking.booking_id}</p>
                       <p className="b-line">
-                        {slot.next_booking.date} at {slot.next_booking.start_time}
+                        <strong>Time:</strong> {slot.next_booking.date} at {slot.next_booking.start_time} - {slot.next_booking.end_time}
                       </p>
                     </div>
                   ) : (
@@ -371,20 +376,24 @@ function App() {
                     disabled={isOccupied}
                     onClick={() => openBookingModal(slot.id)}
                   >
-                    {isOccupied ? "Occupied by Vehicle" : "Book Slot"}
+                    {isOccupied
+                      ? "Occupied by Vehicle"
+                      : isReserved
+                      ? "Book Another Slot / Window"
+                      : "Book Slot"}
                   </button>
 
-                  {slot.active_booking && (
+                  {currentBooking && (
                     <button
                       className="btn btn-cancel"
-                      disabled={cancellingId === slot.active_booking.booking_id}
+                      disabled={cancellingId === currentBooking.booking_id}
                       onClick={() =>
-                        handleCancelBooking(slot.active_booking.booking_id, slot.id)
+                        handleCancelBooking(currentBooking.booking_id, slot.id)
                       }
                     >
-                      {cancellingId === slot.active_booking.booking_id
+                      {cancellingId === currentBooking.booking_id
                         ? "Cancelling..."
-                        : "Cancel Active Booking"}
+                        : `Cancel Reservation (${currentBooking.booking_id})`}
                     </button>
                   )}
                 </div>
