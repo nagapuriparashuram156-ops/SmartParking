@@ -3,8 +3,8 @@ import React, { useEffect, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import "./style.css";
 
-const API_URL = "https://smartparking-api-2026.onrender.com";
-const WEBSITE_URL = "https://smartparking-39mz.onrender.com";
+const API_URL = "https://smartparking-backend-4ivz.onrender.com";
+const WEBSITE_URL = "https://smartparking-mobile.onrender.com";
 
 function App() {
   const [slots, setSlots] = useState([
@@ -376,3 +376,4 @@ function App() {
 }
 
 export default App;
+
