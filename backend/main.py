@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 app = FastAPI(title="Smart Parking API")
 
-# Allow the deployed frontend and local development
+# CORS: allow deployed Render frontend and local development
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -14,6 +14,7 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ],
+    allow_origin_regex=r"https://.*\.onrender\.com",
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -32,19 +33,25 @@ slots = {
     for i in range(1, 4)
 }
 
-# Store bookings in memory
+# In-memory booking storage
 bookings = {1: [], 2: [], 3: []}
+
+# Separate sensor states from booking states
+sensor_states = {1: "Empty", 2: "Empty", 3: "Empty"}
+
+BUFFER_MINUTES = 1
 
 
 def parse_booking(date_str, time_str, duration):
     try:
         start = datetime.strptime(
-            f"{date_str} {time_str}", "%Y-%m-%d %H:%M"
+            f"{date_str} {time_str}",
+            "%Y-%m-%d %H:%M"
         )
     except ValueError:
         raise HTTPException(
             status_code=400,
-            detail="Invalid date or start time. Use YYYY-MM-DD and HH:MM."
+            detail="Invalid date or time. Use YYYY-MM-DD and HH:MM."
         )
 
     if duration < 1 or duration > 1440:
@@ -57,6 +64,39 @@ def parse_booking(date_str, time_str, duration):
     return start, end
 
 
+def booking_to_response(booking):
+    return {
+        "slot_id": booking["slot_id"],
+        "date": booking["date"],
+        "start_time": booking["start"].strftime("%H:%M"),
+        "end_time": booking["end"].strftime("%H:%M"),
+        "duration_minutes": booking["duration_minutes"],
+    }
+
+
+def get_slot_data(slot_id):
+    slot_bookings = bookings[slot_id]
+
+    # Show the latest booking details if bookings exist
+    latest = slot_bookings[-1] if slot_bookings else None
+
+    # Sensor status takes priority for physical occupancy
+    if sensor_states[slot_id] == "Occupied":
+        status = "Occupied"
+    else:
+        # Booking availability is time-based, not permanently Booked
+        status = "Available"
+
+    return {
+        "id": slot_id,
+        "status": status,
+        "date": latest["date"] if latest else None,
+        "start_time": latest["start"].strftime("%H:%M") if latest else None,
+        "end_time": latest["end"].strftime("%H:%M") if latest else None,
+        "duration_minutes": latest["duration_minutes"] if latest else None,
+    }
+
+
 @app.get("/")
 def home():
     return {"message": "Smart Parking API is running"}
@@ -64,33 +104,7 @@ def home():
 
 @app.get("/slots")
 def get_slots():
-    # Update the slot status based on its latest booking
-    result = []
-
-    for slot_id, slot in slots.items():
-        active_bookings = bookings[slot_id]
-
-        if active_bookings:
-            latest = active_bookings[-1]
-            slot.update({
-                "status": "Booked",
-                "date": latest["date"],
-                "start_time": latest["start_time"],
-                "end_time": latest["end_time"],
-                "duration_minutes": latest["duration_minutes"],
-            })
-        else:
-            slot.update({
-                "status": "Available",
-                "date": None,
-                "start_time": None,
-                "end_time": None,
-                "duration_minutes": None,
-            })
-
-        result.append(slot.copy())
-
-    return {"slots": result}
+    return {"slots": [get_slot_data(i) for i in range(1, 4)]}
 
 
 @app.post("/book/{slot_id}")
@@ -103,55 +117,48 @@ def book_slot(
     if slot_id not in slots:
         raise HTTPException(status_code=404, detail="Invalid parking slot.")
 
+    if sensor_states[slot_id] == "Occupied":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Slot {slot_id} is currently occupied by a vehicle."
+        )
+
     start, end = parse_booking(date, start_time, duration_minutes)
 
-    # One-minute buffer after each booking
-    for booking in bookings[slot_id]:
-        existing_start = datetime.strptime(
-            f'{booking["date"]} {booking["start_time"]}',
-            "%Y-%m-%d %H:%M"
-        )
-        existing_end = datetime.strptime(
-            f'{booking["date"]} {booking["end_time"]}',
-            "%Y-%m-%d %H:%M"
-        )
+    # Check conflicts including one-minute buffer
+    for existing in bookings[slot_id]:
+        existing_start = existing["start"]
+        existing_end = existing["end"]
 
-        buffered_start = existing_start - timedelta(minutes=1)
-        buffered_end = existing_end + timedelta(minutes=1)
+        buffered_start = existing_start - timedelta(minutes=BUFFER_MINUTES)
+        buffered_end = existing_end + timedelta(minutes=BUFFER_MINUTES)
 
         if start < buffered_end and end > buffered_start:
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    f"Slot {slot_id} is already booked during this time. "
-                    f"Existing booking: {booking['date']} "
-                    f"{booking['start_time']}–{booking['end_time']}. "
-                    "Please select another time."
+                    f"Slot {slot_id} is unavailable during this time. "
+                    f"Existing booking: {existing['date']} "
+                    f"{existing_start.strftime('%H:%M')}–"
+                    f"{existing_end.strftime('%H:%M')}. "
+                    "Choose another time."
                 )
             )
 
     booking = {
         "slot_id": slot_id,
-        "date": date,
-        "start_time": start.strftime("%H:%M"),
-        "end_time": end.strftime("%H:%M"),
+        "date": start.strftime("%Y-%m-%d"),
+        "start": start,
+        "end": end,
         "duration_minutes": duration_minutes,
     }
 
     bookings[slot_id].append(booking)
 
-    slots[slot_id].update({
-        "status": "Booked",
-        "date": booking["date"],
-        "start_time": booking["start_time"],
-        "end_time": booking["end_time"],
-        "duration_minutes": booking["duration_minutes"],
-    })
-
     return {
         "message": "Booking confirmed successfully!",
-        "slot": slots[slot_id],
-        "booking": booking,
+        "slot": get_slot_data(slot_id),
+        "booking": booking_to_response(booking),
     }
 
 
@@ -167,30 +174,15 @@ def cancel_booking(
     slot_bookings = bookings[slot_id]
 
     for index, booking in enumerate(slot_bookings):
-        if booking["date"] == date and booking["start_time"] == time:
+        if (
+            booking["date"] == date
+            and booking["start"].strftime("%H:%M") == time
+        ):
             slot_bookings.pop(index)
-
-            if slot_bookings:
-                latest = slot_bookings[-1]
-                slots[slot_id].update({
-                    "status": "Booked",
-                    "date": latest["date"],
-                    "start_time": latest["start_time"],
-                    "end_time": latest["end_time"],
-                    "duration_minutes": latest["duration_minutes"],
-                })
-            else:
-                slots[slot_id].update({
-                    "status": "Available",
-                    "date": None,
-                    "start_time": None,
-                    "end_time": None,
-                    "duration_minutes": None,
-                })
 
             return {
                 "message": f"Booking for Slot {slot_id} cancelled successfully.",
-                "slot": slots[slot_id],
+                "slot": get_slot_data(slot_id),
             }
 
     raise HTTPException(
@@ -207,7 +199,16 @@ class SensorUpdate(BaseModel):
 
 @app.get("/sensor/status")
 def get_sensor_status():
-    return {"slots": list(slots.values())}
+    return {
+        "slots": [
+            {
+                "id": slot_id,
+                "status": sensor_states[slot_id],
+                "updated_at": None,
+            }
+            for slot_id in range(1, 4)
+        ]
+    }
 
 
 @app.post("/sensor/update")
@@ -218,9 +219,11 @@ def update_sensor_status(data: SensorUpdate):
     value = data.status.strip().lower()
 
     if value in ("occupied", "full", "vehicle", "vehicle_detected"):
-        slots[data.slot_id]["status"] = "Occupied"
+        sensor_states[data.slot_id] = "Occupied"
+
     elif value in ("empty", "available", "vacant", "no_vehicle"):
-        slots[data.slot_id]["status"] = "Available"
+        sensor_states[data.slot_id] = "Empty"
+
     else:
         raise HTTPException(
             status_code=400,
@@ -229,5 +232,5 @@ def update_sensor_status(data: SensorUpdate):
 
     return {
         "message": "Sensor status updated.",
-        "slot": slots[data.slot_id],
+        "slot": get_slot_data(data.slot_id),
     }
