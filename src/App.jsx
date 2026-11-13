@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from "react";
+import React, { useEffect, useState, useCallback, useMemo } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import "./style.css";
 
@@ -15,6 +15,7 @@ function App() {
     physically_occupied: 0,
     booked_reserved: 0,
     sensor_errors: 0,
+    upcoming_reservations: 0,
   });
   const [bookings, setBookings] = useState([]);
   const [selectedSlot, setSelectedSlot] = useState(null);
@@ -25,7 +26,7 @@ function App() {
   const [errorMsg, setErrorMsg] = useState(null);
   const [loading, setLoading] = useState(false);
   const [cancellingId, setCancellingId] = useState(null);
-  const [backendStatus, setBackendStatus] = useState("connecting"); // "connected", "connecting", "error"
+  const [backendStatus, setBackendStatus] = useState("connecting");
   const [lastRefreshed, setLastRefreshed] = useState(null);
 
   // Helper: Get today's date in YYYY-MM-DD
@@ -107,11 +108,55 @@ function App() {
     return () => clearInterval(interval);
   }, [refreshData]);
 
+  // Existing active bookings for selected slot on chosen date
+  const slotBookingsOnDate = useMemo(() => {
+    if (!selectedSlot || !date) return [];
+    return bookings.filter(
+      (b) =>
+        b.slot_id === selectedSlot &&
+        b.booking_date === date &&
+        b.booking_status === "ACTIVE"
+    );
+  }, [selectedSlot, date, bookings]);
+
+  // Client-side conflict check for selected time window + 1-minute buffer
+  const conflictWarning = useMemo(() => {
+    if (!selectedSlot || !date || !time || !duration) return null;
+    if (slotBookingsOnDate.length === 0) return null;
+
+    const [reqH, reqM] = time.split(":").map(Number);
+    const reqStart = reqH * 60 + reqM;
+    const reqEnd = reqStart + duration;
+
+    for (const b of slotBookingsOnDate) {
+      const bStartParts = (b.start_time || "").slice(0, 5).split(":").map(Number);
+      const bEndParts = (b.end_time || "").slice(0, 5).split(":").map(Number);
+      if (bStartParts.length < 2 || bEndParts.length < 2) continue;
+
+      const bStart = bStartParts[0] * 60 + bStartParts[1];
+      const bEnd = bEndParts[0] * 60 + bEndParts[1];
+
+      // 1-minute safety buffer check
+      const bufStart = bStart - 1;
+      const bufEnd = bEnd + 1;
+
+      if (reqStart < bufEnd && reqEnd > bufStart) {
+        return `Requested window (${time}–${calculateEndTime(time, duration)}) overlaps with existing reservation ${b.start_time.slice(0, 5)}–${b.end_time.slice(0, 5)} (including 1-minute buffer).`;
+      }
+    }
+    return null;
+  }, [selectedSlot, date, time, duration, slotBookingsOnDate]);
+
   // Handle Create Booking
   const handleBookSlot = async (e) => {
     if (e) e.preventDefault();
     if (!selectedSlot || !date || !time || !duration) {
       setErrorMsg("Please select slot, date, start time, and duration.");
+      return;
+    }
+
+    if (conflictWarning) {
+      setErrorMsg(conflictWarning);
       return;
     }
 
@@ -135,7 +180,7 @@ function App() {
       if (response.ok && data.booking) {
         const endTime = calculateEndTime(time, duration);
         setMessage(
-          `Success! Slot ${selectedSlot} is reserved for ${date} from ${time} to ${endTime} (Booking ID: ${data.booking.booking_id}).`
+          `Success! Bay #${selectedSlot} is reserved for ${date} from ${time} to ${endTime} (Booking ID: ${data.booking.booking_id}).`
         );
         setSelectedSlot(null);
         setDate("");
@@ -173,7 +218,7 @@ function App() {
       const data = await response.json().catch(() => ({}));
 
       if (response.ok) {
-        setMessage(`Booking ${bookingId} for Slot ${slotId || ""} was cancelled successfully.`);
+        setMessage(`Booking ${bookingId} for Bay #${slotId || ""} was cancelled successfully. That time window is now free!`);
         await refreshData();
       } else {
         setErrorMsg(data.detail || data.message || "Failed to cancel booking.");
@@ -190,7 +235,6 @@ function App() {
   const openBookingModal = (slotId) => {
     setSelectedSlot(slotId);
     setDate(getTodayDateString());
-    // Default time to current hour + 1 rounded
     const now = new Date();
     const h = String((now.getHours() + 1) % 24).padStart(2, "0");
     setTime(`${h}:00`);
@@ -245,30 +289,30 @@ function App() {
         </div>
       )}
 
-      {/* Dashboard KPI Summary Cards */}
+      {/* Dashboard KPI Summary Cards (Time-Based & Physical Separation) */}
       <section className="kpi-grid">
         <div className="kpi-card">
           <div className="kpi-label">Total Slots</div>
           <div className="kpi-value">{summary.total_slots || 3}</div>
-          <div className="kpi-subtext">Configured bays</div>
+          <div className="kpi-subtext">Physical bays</div>
         </div>
 
         <div className="kpi-card kpi-green">
           <div className="kpi-label">Available Now</div>
           <div className="kpi-value">{summary.available_now}</div>
-          <div className="kpi-subtext">No vehicle & no reservation</div>
+          <div className="kpi-subtext">Empty & no active reservation now</div>
         </div>
 
         <div className="kpi-card kpi-red">
           <div className="kpi-label">Physically Occupied</div>
           <div className="kpi-value">{summary.physically_occupied}</div>
-          <div className="kpi-subtext">ESP32 sensor detected vehicle</div>
+          <div className="kpi-subtext">ESP32 sensor detected vehicles</div>
         </div>
 
         <div className="kpi-card kpi-orange">
           <div className="kpi-label">Booked / Reserved</div>
           <div className="kpi-value">{summary.booked_reserved}</div>
-          <div className="kpi-subtext">Active or upcoming reservation</div>
+          <div className="kpi-subtext">Active reservation right now</div>
         </div>
 
         <div className="kpi-card kpi-gray">
@@ -282,35 +326,49 @@ function App() {
       <section className="section-block">
         <div className="section-header">
           <h2>🅿️ Live Parking Bays</h2>
-          <span className="live-tag">Auto-refreshing via ESP32 telemetry</span>
+          <span className="live-tag">
+            Auto-refreshing via ESP32 telemetry • Time-based availability
+          </span>
         </div>
 
         <div className="slots-grid">
           {slots.map((slot) => {
-            const isOccupied = slot.status === "Occupied";
-            const isReserved = slot.status === "Reserved";
-            const isError = slot.status === "Sensor Error";
+            const isPhysicallyOccupied = slot.physical_status === "Occupied";
+            const isCurrentlyReserved = slot.status === "Reserved";
+            const isSensorError = slot.physical_status === "Error" || slot.status === "Sensor Error";
             const isAvailable = slot.status === "Available";
 
+            // Visual themes:
+            // 1. Physically Occupied: Red (highest priority physical state)
+            // 2. Currently Reserved: Orange (active reservation at current time)
+            // 3. Sensor Error: Gray
+            // 4. Available: Green (even if an upcoming future reservation exists!)
             let cardTheme = "theme-available";
-            let statusBadge = "Available";
+            let statusBadge = "Available Now";
+            let mainStatus = "Available";
             let carIcon = "🚗";
 
-            if (isOccupied) {
+            if (isPhysicallyOccupied) {
               cardTheme = "theme-occupied";
               statusBadge = "Physically Occupied";
-            } else if (isReserved) {
+              mainStatus = "Occupied";
+            } else if (isCurrentlyReserved) {
               cardTheme = "theme-reserved";
-              statusBadge = slot.active_booking
-                ? "Active Reservation"
-                : `Reserved for ${slot.next_booking?.start_time || "Later"}`;
-            } else if (isError) {
+              statusBadge = "Currently Reserved";
+              mainStatus = "Reserved";
+            } else if (isSensorError) {
               cardTheme = "theme-error";
               statusBadge = "Sensor Error";
+              mainStatus = "Sensor Error";
               carIcon = "⚠️";
+            } else {
+              // Available now
+              if (slot.next_booking) {
+                statusBadge = `Available (Booked at ${slot.next_booking.start_time})`;
+              }
             }
 
-            const currentBooking = slot.active_booking || slot.next_booking;
+            const activeOrUpcomingBooking = slot.active_booking || slot.next_booking;
 
             return (
               <div key={slot.id} className={`slot-card ${cardTheme}`}>
@@ -323,15 +381,18 @@ function App() {
 
                 <div className="slot-visual">
                   <span className="slot-car-icon">{carIcon}</span>
-                  <div className="slot-main-status">{slot.status}</div>
+                  <div className="slot-main-status">{mainStatus}</div>
+                  <div className="slot-availability-caption">
+                    {slot.availability_window || "Available for booking"}
+                  </div>
                 </div>
 
                 {/* Sensor Telemetry Box */}
                 <div className="telemetry-box">
                   <div className="telemetry-row">
-                    <span className="tel-label">ESP32 Ultrasonic:</span>
+                    <span className="tel-label">ESP32 Sensor:</span>
                     <span className="tel-value">
-                      {slot.physical_status === "Occupied" ? "Vehicle Detected" : slot.physical_status}
+                      {isPhysicallyOccupied ? "Vehicle Detected" : slot.physical_status}
                     </span>
                   </div>
                   <div className="telemetry-row">
@@ -344,7 +405,7 @@ function App() {
                   </div>
                 </div>
 
-                {/* Reservation Details */}
+                {/* Reservation Details Box */}
                 <div className="booking-info-box">
                   {slot.active_booking ? (
                     <div className="active-booking-info">
@@ -364,7 +425,7 @@ function App() {
                     </div>
                   ) : (
                     <div className="no-booking-info">
-                      <span className="free-tag">No active reservations</span>
+                      <span className="free-tag">No reservations • Free all day</span>
                     </div>
                   )}
                 </div>
@@ -373,27 +434,26 @@ function App() {
                 <div className="slot-card-actions">
                   <button
                     className="btn btn-book"
-                    disabled={isOccupied}
                     onClick={() => openBookingModal(slot.id)}
                   >
-                    {isOccupied
-                      ? "Occupied by Vehicle"
-                      : isReserved
-                      ? "Book Another Slot / Window"
+                    {isPhysicallyOccupied
+                      ? "Reserve Future Window"
+                      : isCurrentlyReserved
+                      ? "Reserve Later Window"
                       : "Book Slot"}
                   </button>
 
-                  {currentBooking && (
+                  {activeOrUpcomingBooking && (
                     <button
                       className="btn btn-cancel"
-                      disabled={cancellingId === currentBooking.booking_id}
+                      disabled={cancellingId === activeOrUpcomingBooking.booking_id}
                       onClick={() =>
-                        handleCancelBooking(currentBooking.booking_id, slot.id)
+                        handleCancelBooking(activeOrUpcomingBooking.booking_id, slot.id)
                       }
                     >
-                      {cancellingId === currentBooking.booking_id
+                      {cancellingId === activeOrUpcomingBooking.booking_id
                         ? "Cancelling..."
-                        : `Cancel Reservation (${currentBooking.booking_id})`}
+                        : `Cancel Booking (${activeOrUpcomingBooking.booking_id})`}
                     </button>
                   )}
                 </div>
@@ -403,18 +463,18 @@ function App() {
         </div>
       </section>
 
-      {/* Booking Modal / Dialog */}
+      {/* Booking Modal / Dialog (Supports Time Window Selection & Conflict Previews) */}
       {selectedSlot && (
         <div className="modal-backdrop" onClick={() => setSelectedSlot(null)}>
           <div className="modal-content" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
-              <h3>Reserve Parking Slot #{selectedSlot}</h3>
+              <h3>Reserve Bay #{selectedSlot}</h3>
               <button className="modal-close-btn" onClick={() => setSelectedSlot(null)}>✕</button>
             </div>
 
             <form onSubmit={handleBookSlot} className="booking-form">
               <div className="form-group">
-                <label>Date</label>
+                <label>Select Date</label>
                 <input
                   type="date"
                   min={getTodayDateString()}
@@ -422,6 +482,29 @@ function App() {
                   onChange={(e) => setDate(e.target.value)}
                   required
                 />
+              </div>
+
+              {/* Reserved Intervals Display for this bay & date */}
+              <div className="slot-day-intervals">
+                <span className="intervals-title">
+                  Existing Reservations for Bay #{selectedSlot} on {date || "date"}:
+                </span>
+                {slotBookingsOnDate.length === 0 ? (
+                  <p className="no-conflicts-note">
+                    ✅ No bookings on this date. All hours are available!
+                  </p>
+                ) : (
+                  <ul className="intervals-list">
+                    {slotBookingsOnDate.map((b) => (
+                      <li key={b.booking_id}>
+                        🔒 <strong>{b.start_time?.slice(0, 5)} – {b.end_time?.slice(0, 5)}</strong> ({formatDuration(b.duration_minutes)})
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <p className="buffer-rule-note">
+                  ℹ️ You can book any open window (e.g. before, between, or after reservations). 1-minute buffer is automatically enforced.
+                </p>
               </div>
 
               <div className="form-group">
@@ -458,14 +541,21 @@ function App() {
                 />
               </div>
 
+              {/* Real-time Overlap Conflict Banner */}
+              {conflictWarning && (
+                <div className="modal-conflict-warning">
+                  ⚠️ {conflictWarning}
+                </div>
+              )}
+
               {/* Calculated Summary Preview */}
-              {date && time && duration > 0 && (
+              {date && time && duration > 0 && !conflictWarning && (
                 <div className="booking-summary-preview">
                   <h4>Reservation Summary</h4>
-                  <p><strong>Slot:</strong> Bay #{selectedSlot}</p>
+                  <p><strong>Bay:</strong> Bay #{selectedSlot}</p>
                   <p><strong>Window:</strong> {date} • {time} to {calculateEndTime(time, duration)}</p>
-                  <p><strong>Total Duration:</strong> {formatDuration(duration)}</p>
-                  <p className="buffer-note">ℹ️ 1-minute buffer automatically enforced before and after</p>
+                  <p><strong>Duration:</strong> {formatDuration(duration)}</p>
+                  <p className="buffer-note">✅ Window is open and conflict-free!</p>
                 </div>
               )}
 
@@ -475,12 +565,12 @@ function App() {
                   className="btn btn-secondary"
                   onClick={() => setSelectedSlot(null)}
                 >
-                  Cancel
+                  Close
                 </button>
                 <button
                   type="submit"
                   className="btn btn-primary"
-                  disabled={loading || !date || !time || duration < 1}
+                  disabled={loading || !date || !time || duration < 1 || Boolean(conflictWarning)}
                 >
                   {loading ? "Confirming..." : "Confirm Reservation"}
                 </button>
@@ -581,7 +671,7 @@ function App() {
 
       {/* Footer */}
       <footer className="footer">
-        <p>Smart Parking System • Hardware, Backend & Cloud Architecture • CSE Major Project</p>
+        <p>Smart Parking System • Time-Based Reservation Engine & ESP32 IoT Telemetry • CSE Major Project</p>
       </footer>
     </div>
   );

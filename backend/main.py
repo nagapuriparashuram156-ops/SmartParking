@@ -168,6 +168,34 @@ def get_slots():
         raise HTTPException(status_code=500, detail=f"Database error fetching slots: {str(e)}")
 
 
+@app.get("/slots/{slot_id}/intervals")
+def get_slot_intervals(slot_id: int, date: Optional[str] = Query(None)):
+    """Returns booked intervals for a slot on a given date to facilitate time window selection."""
+    if slot_id not in (1, 2, 3):
+        raise HTTPException(status_code=404, detail="Invalid slot ID.")
+    try:
+        bookings = db.get_bookings(slot_id=slot_id, status="ACTIVE")
+        if date:
+            bookings = [b for b in bookings if b.get("booking_date") == date]
+        intervals = [
+            {
+                "booking_id": b["booking_id"],
+                "date": b["booking_date"],
+                "start_time": str(b["start_time"])[:5],
+                "end_time": str(b["end_time"])[:5],
+                "duration_minutes": b["duration_minutes"],
+            }
+            for b in bookings
+        ]
+        return {
+            "slot_id": slot_id,
+            "date": date,
+            "booked_intervals": intervals,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error fetching intervals: {str(e)}")
+
+
 @app.get("/sensor/status")
 def get_sensor_status():
     """Hardware sensor status for all 3 slots."""

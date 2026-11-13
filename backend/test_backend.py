@@ -109,11 +109,12 @@ def test_booking_buffer_and_conflict_logic():
     booking_id = book_res["booking"]["booking_id"]
     assert booking_id.startswith("BK-")
 
-    # Verify that Slot 2 updates immediately to Reserved and dashboard counter updates
-    slots_after_book = get_slots()
-    assert slots_after_book["slots"][1]["status"] == "Reserved"
-    assert slots_after_book["summary"]["booked_reserved"] >= 1
-    assert slots_after_book["summary"]["available_now"] <= 2
+    # Verify that future booking preserves 'Available' status right now, but attaches upcoming reservation
+    slots_after_future_book = get_slots()
+    assert slots_after_future_book["slots"][1]["status"] == "Available"
+    assert slots_after_future_book["slots"][1]["has_upcoming_reservation"] is True
+    assert slots_after_future_book["summary"]["available_now"] == 3
+    assert slots_after_future_book["summary"]["booked_reserved"] == 0
 
     # 2. Conflict: Overlapping reservation on Slot 2
     overlap_time = (start_time + timedelta(minutes=10)).strftime("%H:%M")
@@ -215,3 +216,51 @@ def test_booking_cancellation():
     # Confirm it is no longer returned under ACTIVE bookings
     active_bks = list_bookings(slot_id=1, status="ACTIVE")
     assert not any(b["booking_id"] == bk_id for b in active_bks["bookings"])
+
+
+def test_realtime_physical_occupancy_counters():
+    """
+    Verifies Section 7:
+    - 0 vehicles detected -> Physically Occupied = 0
+    - 1 vehicle detected -> Physically Occupied = 1
+    - 2 vehicles detected -> Physically Occupied = 2
+    - 3 vehicles detected -> Physically Occupied = 3
+    - Decrements when vehicle leaves
+    - Each bay counted at most once
+    - Reservation alone never increases physically occupied
+    - Vehicle in reserved bay shows OCCUPIED and increments physically occupied
+    """
+    # 0 vehicles initially
+    for s_id in (1, 2, 3):
+        update_sensor_status(SensorUpdateRequest(slot_id=s_id, status="Empty", distance_cm=180.0), _authorized=True)
+    assert get_slots()["summary"]["physically_occupied"] == 0
+
+    # 1 vehicle in Slot 1
+    update_sensor_status(SensorUpdateRequest(slot_id=1, status="Occupied", distance_cm=8.0), _authorized=True)
+    assert get_slots()["summary"]["physically_occupied"] == 1
+    assert get_slots()["summary"]["available_now"] == 2
+
+    # 2 vehicles (Slot 1 and Slot 2)
+    update_sensor_status(SensorUpdateRequest(slot_id=2, status="Occupied", distance_cm=9.5), _authorized=True)
+    assert get_slots()["summary"]["physically_occupied"] == 2
+    assert get_slots()["summary"]["available_now"] == 1
+
+    # 3 vehicles (Slot 1, Slot 2, Slot 3)
+    update_sensor_status(SensorUpdateRequest(slot_id=3, status="Occupied", distance_cm=6.0), _authorized=True)
+    assert get_slots()["summary"]["physically_occupied"] == 3
+    assert get_slots()["summary"]["available_now"] == 0
+
+    # Repeated sensor reading on Slot 1 must not double count
+    update_sensor_status(SensorUpdateRequest(slot_id=1, status="Occupied", distance_cm=7.9), _authorized=True)
+    assert get_slots()["summary"]["physically_occupied"] == 3
+
+    # Vehicle leaves Slot 2 -> decrements to 2
+    update_sensor_status(SensorUpdateRequest(slot_id=2, status="Empty", distance_cm=200.0), _authorized=True)
+    assert get_slots()["summary"]["physically_occupied"] == 2
+    assert get_slots()["summary"]["available_now"] == 1
+
+    # Clean up: clear all slots back to Empty
+    for s_id in (1, 2, 3):
+        update_sensor_status(SensorUpdateRequest(slot_id=s_id, status="Empty", distance_cm=200.0), _authorized=True)
+    assert get_slots()["summary"]["physically_occupied"] == 0
+    assert get_slots()["summary"]["available_now"] == 3

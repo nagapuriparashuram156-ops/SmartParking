@@ -573,9 +573,11 @@ class DatabaseManager:
 
                 slot_b_list = bookings_by_slot.get(slot_id, [])
 
-                # Determine if there is an active reservation covering current time
+                # Check bookings for this slot
                 active_booking = None
                 next_booking = None
+                upcoming_bookings_list = []
+                booked_intervals = []
 
                 for b in slot_b_list:
                     s_raw = b["start_datetime"]
@@ -587,40 +589,66 @@ class DatabaseManager:
                         s_dt = s_raw.replace(tzinfo=TIMEZONE)
                         e_dt = e_raw.replace(tzinfo=TIMEZONE)
 
+                    b_interval = {
+                        "booking_id": b["booking_id"],
+                        "date": str(b["booking_date"]),
+                        "start_time": str(b["start_time"])[:5],
+                        "end_time": str(b["end_time"])[:5],
+                        "duration_minutes": b.get("duration_minutes", 60),
+                    }
+                    booked_intervals.append(b_interval)
+
                     if s_dt <= now < e_dt:
                         active_booking = b
-                    elif s_dt > now and next_booking is None:
-                        next_booking = b
+                    elif s_dt > now:
+                        upcoming_bookings_list.append(b)
+                        if next_booking is None:
+                            next_booking = b
 
                 # Compute effective slot status:
-                # Priority:
                 # 1. Physically Occupied: Sensor detects vehicle -> 'Occupied'
-                # 2. Reservation: Has active reservation now or confirmed upcoming reservation -> 'Reserved'
-                # 3. Sensor Error: Sensor hardware error or unknown -> 'Sensor Error'
-                # 4. Otherwise -> 'Available'
-                has_reservation = (active_booking is not None) or (next_booking is not None)
+                # 2. Active Reservation: Has active reservation covering CURRENT time -> 'Reserved'
+                # 3. Sensor Error: Sensor hardware error or timeout -> 'Sensor Error'
+                # 4. Available: Physically empty and no ACTIVE reservation right now (future bookings do not block current availability!)
+                is_occupied = (phys_status == "Occupied")
+                is_currently_reserved = (active_booking is not None)
 
-                if phys_status == "Occupied":
+                if is_occupied:
                     effective_status = "Occupied"
-                elif has_reservation:
+                elif is_currently_reserved:
                     effective_status = "Reserved"
                 elif phys_status in ("Error", "Unknown"):
                     effective_status = "Sensor Error"
                 else:
                     effective_status = "Available"
 
-                # Pick active or upcoming or latest booking for display
+                # Pick latest active or upcoming booking for display
                 display_booking = active_booking or next_booking or (slot_b_list[-1] if slot_b_list else None)
+
+                # Formulate next availability caption
+                if next_booking and not is_currently_reserved:
+                    availability_window = f"Available now until {str(next_booking['start_time'])[:5]}"
+                elif is_currently_reserved:
+                    availability_window = f"Reserved until {str(active_booking['end_time'])[:5]}"
+                elif is_occupied:
+                    availability_window = "Occupied by vehicle"
+                else:
+                    availability_window = "Available all day"
 
                 computed_slots.append({
                     "id": slot_id,
                     "slot_number": s["slot_number"],
                     "status": effective_status,
                     "physical_status": phys_status,
-                    "reservation_status": "Active Reservation" if active_booking else ("Upcoming Reservation" if next_booking else "None"),
+                    "is_physically_occupied": is_occupied,
+                    "is_currently_reserved": is_currently_reserved,
+                    "has_upcoming_reservation": (next_booking is not None),
+                    "reservation_status": "Active Reservation" if is_currently_reserved else ("Upcoming Reservation" if next_booking else "None"),
                     "distance_cm": dist,
                     "last_sensor_update": heartbeat,
                     "is_sensor_healthy": bool(s.get("is_healthy", 1)),
+                    "availability_window": availability_window,
+                    "booked_intervals": booked_intervals,
                     "active_booking": {
                         "booking_id": active_booking["booking_id"],
                         "date": str(active_booking["booking_date"]),
@@ -635,6 +663,7 @@ class DatabaseManager:
                         "end_time": str(next_booking["end_time"])[:5],
                         "duration_minutes": next_booking.get("duration_minutes", 60),
                     } if next_booking else None,
+                    "upcoming_count": len(upcoming_bookings_list),
                     # Backward compatibility fields for existing frontend expectations
                     "date": str(display_booking["booking_date"]) if display_booking else None,
                     "start_time": str(display_booking["start_time"])[:5] if display_booking else None,
@@ -643,12 +672,13 @@ class DatabaseManager:
                     "booking_id": display_booking["booking_id"] if display_booking else None,
                 })
 
-            # Calculate accurate dashboard summary counts
+            # Calculate accurate dashboard summary counts (Independently verified):
             total_slots = len(computed_slots)
-            physically_occupied = sum(1 for s in computed_slots if s["physical_status"] == "Occupied")
-            booked_reserved = sum(1 for s in computed_slots if s["status"] == "Reserved")
-            sensor_errors = sum(1 for s in computed_slots if s["physical_status"] in ("Error", "Unknown"))
+            physically_occupied = sum(1 for s in computed_slots if s["is_physically_occupied"])
+            booked_reserved = sum(1 for s in computed_slots if s["is_currently_reserved"])
             available_now = sum(1 for s in computed_slots if s["status"] == "Available")
+            sensor_errors = sum(1 for s in computed_slots if s["physical_status"] in ("Error", "Unknown"))
+            total_upcoming = sum(s["upcoming_count"] for s in computed_slots)
 
             counts = {
                 "total_slots": total_slots,
@@ -656,6 +686,7 @@ class DatabaseManager:
                 "physically_occupied": physically_occupied,
                 "booked_reserved": booked_reserved,
                 "sensor_errors": sensor_errors,
+                "upcoming_reservations": total_upcoming,
                 # For compatibility with simple cards:
                 "total": total_slots,
                 "available": available_now,
