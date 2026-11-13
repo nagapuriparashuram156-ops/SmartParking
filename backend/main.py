@@ -2,9 +2,11 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime, timedelta
+from pydantic import BaseModel
 
 app = FastAPI(title="Smart Parking API")
 
+# Allow the deployed frontend and local development
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -12,11 +14,12 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Three parking slots
 slots = {
     i: {
         "id": i,
@@ -29,7 +32,29 @@ slots = {
     for i in range(1, 4)
 }
 
-bookings = {i: [] for i in range(1, 4)}
+# Store bookings in memory
+bookings = {1: [], 2: [], 3: []}
+
+
+def parse_booking(date_str, time_str, duration):
+    try:
+        start = datetime.strptime(
+            f"{date_str} {time_str}", "%Y-%m-%d %H:%M"
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid date or start time. Use YYYY-MM-DD and HH:MM."
+        )
+
+    if duration < 1 or duration > 1440:
+        raise HTTPException(
+            status_code=400,
+            detail="Duration must be between 1 and 1440 minutes."
+        )
+
+    end = start + timedelta(minutes=duration)
+    return start, end
 
 
 @app.get("/")
@@ -39,17 +64,15 @@ def home():
 
 @app.get("/slots")
 def get_slots():
-    now = datetime.now()
+    # Update the slot status based on its latest booking
+    result = []
 
-    for slot_id in slots:
-        active = [
-            b for b in bookings[slot_id]
-            if datetime.fromisoformat(b["end"]) > now
-        ]
+    for slot_id, slot in slots.items():
+        active_bookings = bookings[slot_id]
 
-        if active:
-            latest = max(active, key=lambda b: b["start"])
-            slots[slot_id].update({
+        if active_bookings:
+            latest = active_bookings[-1]
+            slot.update({
                 "status": "Booked",
                 "date": latest["date"],
                 "start_time": latest["start_time"],
@@ -57,7 +80,7 @@ def get_slots():
                 "duration_minutes": latest["duration_minutes"],
             })
         else:
-            slots[slot_id].update({
+            slot.update({
                 "status": "Available",
                 "date": None,
                 "start_time": None,
@@ -65,7 +88,9 @@ def get_slots():
                 "duration_minutes": None,
             })
 
-    return {"slots": list(slots.values())}
+        result.append(slot.copy())
+
+    return {"slots": result}
 
 
 @app.post("/book/{slot_id}")
@@ -73,72 +98,136 @@ def book_slot(
     slot_id: int,
     date: str,
     start_time: str,
-    duration_minutes: int,
+    duration_minutes: int = 60
 ):
     if slot_id not in slots:
-        raise HTTPException(status_code=404, detail="Invalid slot")
+        raise HTTPException(status_code=404, detail="Invalid parking slot.")
 
-    if duration_minutes < 1 or duration_minutes > 1440:
-        raise HTTPException(status_code=400, detail="Invalid duration")
+    start, end = parse_booking(date, start_time, duration_minutes)
 
-    try:
-        start = datetime.strptime(
-            f"{date} {start_time}", "%Y-%m-%d %H:%M"
-        )
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid date or time")
-
-    end = start + timedelta(minutes=duration_minutes)
-
-    if start < datetime.now():
-        raise HTTPException(status_code=400, detail="Choose a future time")
-
+    # One-minute buffer after each booking
     for booking in bookings[slot_id]:
-        existing_start = datetime.fromisoformat(booking["start"])
-        existing_end = datetime.fromisoformat(booking["end"])
+        existing_start = datetime.strptime(
+            f'{booking["date"]} {booking["start_time"]}',
+            "%Y-%m-%d %H:%M"
+        )
+        existing_end = datetime.strptime(
+            f'{booking["date"]} {booking["end_time"]}',
+            "%Y-%m-%d %H:%M"
+        )
 
-        # One-minute buffer between bookings
-        if start < existing_end + timedelta(minutes=1) and \
-           end + timedelta(minutes=1) > existing_start:
+        buffered_start = existing_start - timedelta(minutes=1)
+        buffered_end = existing_end + timedelta(minutes=1)
+
+        if start < buffered_end and end > buffered_start:
             raise HTTPException(
                 status_code=409,
-                detail="This slot is already booked for that time"
+                detail=(
+                    f"Slot {slot_id} is already booked during this time. "
+                    f"Existing booking: {booking['date']} "
+                    f"{booking['start_time']}–{booking['end_time']}. "
+                    "Please select another time."
+                )
             )
 
-    new_booking = {
+    booking = {
+        "slot_id": slot_id,
         "date": date,
-        "start_time": start_time,
+        "start_time": start.strftime("%H:%M"),
         "end_time": end.strftime("%H:%M"),
         "duration_minutes": duration_minutes,
-        "start": start.isoformat(),
-        "end": end.isoformat(),
     }
 
-    bookings[slot_id].append(new_booking)
+    bookings[slot_id].append(booking)
+
+    slots[slot_id].update({
+        "status": "Booked",
+        "date": booking["date"],
+        "start_time": booking["start_time"],
+        "end_time": booking["end_time"],
+        "duration_minutes": booking["duration_minutes"],
+    })
 
     return {
-        "message": "Booking confirmed",
-        "slot": {
-            "id": slot_id,
-            "status": "Booked",
-            **new_booking,
-        },
+        "message": "Booking confirmed successfully!",
+        "slot": slots[slot_id],
+        "booking": booking,
     }
 
 
 @app.post("/cancel/{slot_id}")
-def cancel_booking(slot_id: int, date: str, time: str):
+def cancel_booking(
+    slot_id: int,
+    date: str,
+    time: str
+):
     if slot_id not in slots:
-        raise HTTPException(status_code=404, detail="Invalid slot")
+        raise HTTPException(status_code=404, detail="Invalid parking slot.")
 
-    for booking in bookings[slot_id]:
+    slot_bookings = bookings[slot_id]
+
+    for index, booking in enumerate(slot_bookings):
         if booking["date"] == date and booking["start_time"] == time:
-            bookings[slot_id].remove(booking)
-            return {"message": "Booking cancelled"}
+            slot_bookings.pop(index)
 
-    raise HTTPException(status_code=404, detail="Booking not found")
+            if slot_bookings:
+                latest = slot_bookings[-1]
+                slots[slot_id].update({
+                    "status": "Booked",
+                    "date": latest["date"],
+                    "start_time": latest["start_time"],
+                    "end_time": latest["end_time"],
+                    "duration_minutes": latest["duration_minutes"],
+                })
+            else:
+                slots[slot_id].update({
+                    "status": "Available",
+                    "date": None,
+                    "start_time": None,
+                    "end_time": None,
+                    "duration_minutes": None,
+                })
+
+            return {
+                "message": f"Booking for Slot {slot_id} cancelled successfully.",
+                "slot": slots[slot_id],
+            }
+
+    raise HTTPException(
+        status_code=404,
+        detail="Matching booking was not found."
+    )
+
+
+# Sensor API
+class SensorUpdate(BaseModel):
+    slot_id: int
+    status: str
 
 
 @app.get("/sensor/status")
-def sensor_status():
+def get_sensor_status():
     return {"slots": list(slots.values())}
+
+
+@app.post("/sensor/update")
+def update_sensor_status(data: SensorUpdate):
+    if data.slot_id not in slots:
+        raise HTTPException(status_code=404, detail="Invalid slot ID.")
+
+    value = data.status.strip().lower()
+
+    if value in ("occupied", "full", "vehicle", "vehicle_detected"):
+        slots[data.slot_id]["status"] = "Occupied"
+    elif value in ("empty", "available", "vacant", "no_vehicle"):
+        slots[data.slot_id]["status"] = "Available"
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Status must be Empty/Available or Occupied."
+        )
+
+    return {
+        "message": "Sensor status updated.",
+        "slot": slots[data.slot_id],
+    }
