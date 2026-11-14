@@ -83,7 +83,7 @@ def test_02_one_vehicle_detected_slot1():
     summary = data["summary"]
     assert summary["physically_occupied"] == 1
     assert summary["physical_available"] == 2
-    assert summary["available_now"] == 2
+    assert summary["available_for_booking"] == 3
     assert data["slots"][0]["status"] == "Occupied"
     assert data["slots"][0]["is_physically_occupied"] is True
 
@@ -99,7 +99,7 @@ def test_03_vehicles_detected_slots_1_and_2():
     summary = data["summary"]
     assert summary["physically_occupied"] == 2
     assert summary["physical_available"] == 1
-    assert summary["available_now"] == 1
+    assert summary["available_for_booking"] == 3
 
 
 # ====================================================================
@@ -113,7 +113,7 @@ def test_04_all_three_slots_occupied():
     summary = data["summary"]
     assert summary["physically_occupied"] == 3
     assert summary["physical_available"] == 0
-    assert summary["available_now"] == 0
+    assert summary["available_for_booking"] == 3
 
 
 # ====================================================================
@@ -438,3 +438,195 @@ def test_24_future_booking_does_not_block_current_available_time_window():
     assert summary["available_now"] == 3
     assert slot1["is_available_now"] is True
     assert "Available now until" in slot1["availability_window"]
+
+
+# ====================================================================
+# TEST 25: Initial State - 3 Bays Configured, Available for Booking = 3
+# ====================================================================
+def test_25_initial_available_for_booking_is_three():
+    data = get_slots()
+    summary = data["summary"]
+    assert summary["total_slots"] == 3
+    assert summary["available_for_booking"] == 3
+    assert summary["available_now"] == 3
+    for slot in data["slots"]:
+        assert slot["is_bookable_today"] is True
+
+
+# ====================================================================
+# TEST 26: Bay 1 Booked for 1 Hour - Available for Booking REMAINS 3
+# ====================================================================
+def test_26_bay_1_hourly_booking_available_for_booking_remains_3():
+    today_str = get_current_time().strftime("%Y-%m-%d")
+    
+    # Book Bay 1 for 1 hour (08:00 to 09:00)
+    res = book_slot(
+        slot_id=1,
+        body=BookingCreateRequest(date=today_str, start_time="08:00", duration_minutes=60)
+    )
+    assert res["booking"]["booking_id"].startswith("BK-")
+
+    data = get_slots()
+    summary = data["summary"]
+    
+    # CRITICAL REQUIREMENT: A bay with an hourly reservation is NOT unavailable for the whole day.
+    # It must still count in Available for Booking because other time windows can be reserved.
+    assert summary["available_for_booking"] == 3
+    assert summary["available_now"] == 3
+    assert data["slots"][0]["is_bookable_today"] is True
+
+
+# ====================================================================
+# TEST 27: Bay 1 Multiple Sequential Bookings - Available for Booking REMAINS 3
+# ====================================================================
+def test_27_bay_1_sequential_bookings_available_for_booking_remains_3():
+    today_str = get_current_time().strftime("%Y-%m-%d")
+    
+    # Bay 1 multiple sequential bookings for different cars at different times
+    b1 = book_slot(slot_id=1, body=BookingCreateRequest(date=today_str, start_time="08:00", duration_minutes=60))
+    b2 = book_slot(slot_id=1, body=BookingCreateRequest(date=today_str, start_time="09:01", duration_minutes=59))
+    b3 = book_slot(slot_id=1, body=BookingCreateRequest(date=today_str, start_time="10:01", duration_minutes=59))
+    
+    assert b1["booking"]["booking_id"].startswith("BK-")
+    assert b2["booking"]["booking_id"].startswith("BK-")
+    assert b3["booking"]["booking_id"].startswith("BK-")
+
+    data = get_slots()
+    summary = data["summary"]
+    
+    # Available for booking remains 3 because other time windows remain open today
+    assert summary["available_for_booking"] == 3
+    assert data["slots"][0]["is_bookable_today"] is True
+
+
+# ====================================================================
+# TEST 28: Bay 1 Booked for Entire Day - Available for Booking Decreases to 2
+# ====================================================================
+def test_28_bay_1_all_day_booking_available_for_booking_decreases_to_2():
+    today_str = get_current_time().strftime("%Y-%m-%d")
+    
+    # Book Bay 1 for entire day (1440 minutes)
+    res = book_slot(
+        slot_id=1,
+        body=BookingCreateRequest(date=today_str, start_time="00:00", duration_minutes=1440)
+    )
+    assert res["booking"]["booking_id"].startswith("BK-")
+
+    data = get_slots()
+    summary = data["summary"]
+    
+    # Bay 1 is fully booked for today, bays 2 & 3 remain open
+    assert summary["available_for_booking"] == 2
+    assert summary["available_now"] == 2
+    assert data["slots"][0]["is_bookable_today"] is False
+    assert data["slots"][1]["is_bookable_today"] is True
+    assert data["slots"][2]["is_bookable_today"] is True
+    assert data["slots"][0]["availability_window"] == "Fully booked for today"
+
+
+# ====================================================================
+# TEST 29: Bay 1 & Bay 2 Booked for Entire Day - Available for Booking Decreases to 1
+# ====================================================================
+def test_29_bays_1_and_2_all_day_booking_available_for_booking_decreases_to_1():
+    today_str = get_current_time().strftime("%Y-%m-%d")
+    
+    book_slot(slot_id=1, body=BookingCreateRequest(date=today_str, start_time="00:00", duration_minutes=1440))
+    book_slot(slot_id=2, body=BookingCreateRequest(date=today_str, start_time="00:00", duration_minutes=1440))
+
+    data = get_slots()
+    summary = data["summary"]
+    
+    assert summary["available_for_booking"] == 1
+    assert summary["available_now"] == 1
+    assert data["slots"][0]["is_bookable_today"] is False
+    assert data["slots"][1]["is_bookable_today"] is False
+    assert data["slots"][2]["is_bookable_today"] is True
+
+
+# ====================================================================
+# TEST 30: All 3 Bays Booked for Entire Day - Available for Booking Decreases to 0
+# ====================================================================
+def test_30_all_3_bays_all_day_booking_available_for_booking_decreases_to_0():
+    today_str = get_current_time().strftime("%Y-%m-%d")
+    
+    book_slot(slot_id=1, body=BookingCreateRequest(date=today_str, start_time="00:00", duration_minutes=1440))
+    book_slot(slot_id=2, body=BookingCreateRequest(date=today_str, start_time="00:00", duration_minutes=1440))
+    book_slot(slot_id=3, body=BookingCreateRequest(date=today_str, start_time="00:00", duration_minutes=1440))
+
+    data = get_slots()
+    summary = data["summary"]
+    
+    assert summary["available_for_booking"] == 0
+    assert summary["available_now"] == 0
+    for slot in data["slots"]:
+        assert slot["is_bookable_today"] is False
+        assert slot["availability_window"] == "Fully booked for today"
+
+
+# ====================================================================
+# TEST 31: Cancelling All-Day Reservation Increases Available for Booking Again
+# ====================================================================
+def test_31_cancelling_all_day_reservation_increases_available_for_booking():
+    today_str = get_current_time().strftime("%Y-%m-%d")
+    
+    b1 = book_slot(slot_id=1, body=BookingCreateRequest(date=today_str, start_time="00:00", duration_minutes=1440))
+    b2 = book_slot(slot_id=2, body=BookingCreateRequest(date=today_str, start_time="00:00", duration_minutes=1440))
+    b3 = book_slot(slot_id=3, body=BookingCreateRequest(date=today_str, start_time="00:00", duration_minutes=1440))
+
+    # All 3 bays booked all-day: available_for_booking = 0
+    assert get_slots()["summary"]["available_for_booking"] == 0
+
+    # Cancel Bay 1 all-day reservation
+    delete_booking(b1["booking"]["booking_id"])
+
+    data = get_slots()
+    assert data["summary"]["available_for_booking"] == 1
+    assert data["slots"][0]["is_bookable_today"] is True
+
+    # Cancel Bay 2 all-day reservation
+    delete_booking(b2["booking"]["booking_id"])
+    assert get_slots()["summary"]["available_for_booking"] == 2
+
+    # Cancel Bay 3 all-day reservation
+    delete_booking(b3["booking"]["booking_id"])
+    assert get_slots()["summary"]["available_for_booking"] == 3
+
+
+# ====================================================================
+# TEST 32: Physical Occupancy Controlled Exclusively by ESP32 Readings
+# ====================================================================
+def test_32_physical_occupancy_exclusively_controlled_by_esp32_readings():
+    # ESP32 detects vehicle in Bay 1 (distance = 8.5 cm < 10.0 cm threshold)
+    update_sensor_status(SensorUpdateRequest(slot_id=1, occupied=True, distance_cm=8.5), _authorized=True)
+
+    data = get_slots()
+    summary = data["summary"]
+    
+    # Physical counters update
+    assert summary["physically_occupied"] == 1
+    assert summary["physical_available"] == 2
+    assert data["slots"][0]["is_physically_occupied"] is True
+    assert data["slots"][0]["status"] == "Occupied"
+
+    # Physical car does NOT reduce day-level Available for Booking
+    assert summary["available_for_booking"] == 3
+    assert data["slots"][0]["is_bookable_today"] is True
+
+
+# ====================================================================
+# TEST 33: Booked / Reserved Counts All Confirmed Reservations Separately
+# ====================================================================
+def test_33_booked_reserved_counts_all_confirmed_reservations_separately():
+    today_str = get_current_time().strftime("%Y-%m-%d")
+    
+    # 2 sequential bookings on Bay 1, 1 booking on Bay 2
+    book_slot(slot_id=1, body=BookingCreateRequest(date=today_str, start_time="08:00", duration_minutes=60))
+    book_slot(slot_id=1, body=BookingCreateRequest(date=today_str, start_time="09:01", duration_minutes=60))
+    book_slot(slot_id=2, body=BookingCreateRequest(date=today_str, start_time="10:00", duration_minutes=60))
+
+    summary = get_slots()["summary"]
+    # Booked / Reserved = 3 (all 3 reservation records counted)
+    assert summary["booked_reserved"] == 3
+    # Available for Booking = 3 (no bay is booked for entire day)
+    assert summary["available_for_booking"] == 3
+

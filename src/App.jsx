@@ -176,17 +176,27 @@ function App() {
       (s) => s.status === "Sensor Error" || s.physical_status === "Error"
     ).length;
 
-    // Available for Booking: physically empty AND not currently reserved
-    const availableNow = slots.length > 0
-      ? slots.filter((s) => s.is_available_now).length
-      : (summary.available_now ?? 3);
+    // Available for Booking KPI:
+    // Number of physical parking bays that remain available for at least some bookable time during the day.
+    // 3 physical parking bays total.
+    // An hourly reservation does NOT make a bay unavailable for the whole day.
+    // Only decreases when a bay is booked for the entire day.
+    let availableForBookingCount = 3;
+    if (slots && slots.length > 0) {
+      availableForBookingCount = slots.filter((s) => s.is_bookable_today !== false).length;
+    } else if (summary.available_for_booking != null) {
+      availableForBookingCount = summary.available_for_booking;
+    } else if (summary.available_now != null) {
+      availableForBookingCount = summary.available_now;
+    }
 
     return {
       total_slots: total,
       physical_available: physicalAvailable,
       physically_occupied: occupied,
       booked_reserved: reservedCount,
-      available_now: availableNow,
+      available_for_booking: availableForBookingCount,
+      available_now: availableForBookingCount,
       sensor_errors: errors,
     };
   }, [slots, bookings, summary]);
@@ -613,8 +623,8 @@ function App() {
 
         <div className="kpi-card kpi-blue">
           <div className="kpi-label">Available for Booking</div>
-          <div className="kpi-value">{displaySummary.available_now}</div>
-          <div className="kpi-subtext">Empty & ready to reserve now</div>
+          <div className="kpi-value">{displaySummary.available_for_booking}</div>
+          <div className="kpi-subtext">Bays with open time slots today</div>
         </div>
 
         <div className="kpi-card kpi-gray">

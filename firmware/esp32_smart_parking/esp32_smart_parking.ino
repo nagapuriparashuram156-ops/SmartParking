@@ -79,14 +79,14 @@
 // =============================================================================
 
 // Wi-Fi Credentials
-// For local testing, configure your mobile hotspot SSID and Password:
-// SSID: "ko_102 2G" | Password: "123456789"
+// Configure your mobile hotspot SSID and Password:
+// SSID: "parshuram" | Password: "12345679"
 #ifndef WIFI_SSID
-#define WIFI_SSID "ko_102 2G"
+#define WIFI_SSID "parshuram"
 #endif
 
 #ifndef WIFI_PASSWORD
-#define WIFI_PASSWORD "123456789"
+#define WIFI_PASSWORD "12345679"
 #endif
 
 // Backend API URL (Render Cloud Service)
@@ -191,14 +191,15 @@ float readUltrasonicDistance(int trigPin, int echoPin) {
   digitalWrite(trigPin, LOW);
 
   // Measure round-trip echo pulse duration
-  // Sound velocity ~0.0343 cm/microsecond (round-trip divider: 58.2)
+  // Sound velocity ~0.0343 cm/microsecond (round-trip divider: 2)
   unsigned long duration_us = pulseIn(echoPin, HIGH, SENSOR_TIMEOUT_US);
 
   if (duration_us == 0) {
     return -1.0f; // Timeout / sensor disconnected
   }
 
-  float distance_cm = duration_us / 58.2f;
+  // Exact speed of sound distance calculation: duration_us * 0.0343 / 2
+  float distance_cm = duration_us * 0.0343f / 2.0f;
 
   if (distance_cm < 1.0f || distance_cm > SENSOR_MAX_VALID_CM) {
     return -1.0f; // Out of valid measurement bounds
@@ -458,8 +459,14 @@ void loop() {
       // Update physical LEDs immediately on verified state change
       updateBayLEDs(i, slot_states[i].published_status);
 
-      Serial.printf("[LOCAL STATE CHANGE] Bay #%d: %s (%.1f cm) -> LEDs Updated in <200ms\n",
-                    slot_id, slot_states[i].published_status.c_str(), distance);
+      // Serial monitor reporting matching user specification
+      if (slot_states[i].published_status == "Occupied") {
+        Serial.printf("Bay %d: %.1f cm | OCCUPIED | RED LED ON\n", slot_id, distance);
+      } else if (slot_states[i].published_status == "Empty") {
+        Serial.printf("Bay %d: %.1f cm | EMPTY | GREEN LED ON\n", slot_id, distance);
+      } else {
+        Serial.printf("Bay %d: SENSOR ERROR | BOTH LEDs OFF\n", slot_id);
+      }
     }
 
     // Ensure initial LED state is established on first reading

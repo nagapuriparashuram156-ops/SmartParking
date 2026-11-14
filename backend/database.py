@@ -89,6 +89,67 @@ def parse_datetime_to_kolkata(dt_val: Any) -> Optional[datetime]:
     return None
 
 
+def check_slot_bookable_today(slot_bookings: list, target_date_str: str) -> bool:
+    """
+    Evaluates whether a parking slot remains available for at least some bookable time
+    during the specified date (target_date_str in YYYY-MM-DD).
+    
+    A slot is considered bookable (True) if there is any free time window left today.
+    It is considered fully booked (False) ONLY when booked for the entire day (e.g. 
+    an all-day reservation of 1440 min or merged reservations covering [0, 1440]).
+    
+    Hourly or sequential bookings (e.g. 08:00 to 09:00) leave the rest of the day free,
+    so the bay remains Available for Booking.
+    """
+    blocked_ranges = []
+    for b in slot_bookings:
+        if b.get("booking_status") == "CANCELLED":
+            continue
+        s_dt = parse_datetime_to_kolkata(b.get("start_datetime"))
+        e_dt = parse_datetime_to_kolkata(b.get("end_datetime"))
+        if not s_dt or not e_dt:
+            continue
+
+        s_date = s_dt.strftime("%Y-%m-%d")
+        e_date = e_dt.strftime("%Y-%m-%d")
+
+        # Check if booking touches target date
+        if s_date != target_date_str and e_date != target_date_str:
+            # Check if it spans across target date
+            if s_date < target_date_str and e_date > target_date_str:
+                return False
+            continue
+
+        s_min = (s_dt.hour * 60 + s_dt.minute) if s_date == target_date_str else 0
+        e_min = (e_dt.hour * 60 + e_dt.minute) if e_date == target_date_str else 1440
+        dur = int(b.get("duration_minutes") or (e_min - s_min))
+
+        # Check if this single booking covers the entire day
+        if dur >= 1439 or (s_min <= 0 and e_min >= 1439):
+            return False
+
+        blocked_ranges.append((max(0, s_min), min(1440, e_min)))
+
+    if not blocked_ranges:
+        return True
+
+    # Merge overlapping blocked ranges
+    blocked_ranges.sort()
+    merged = []
+    for start, end in blocked_ranges:
+        if not merged or merged[-1][1] < start:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+
+    # Check if merged ranges cover the entire 1440 minutes of the day
+    total_blocked = sum(end - start for start, end in merged)
+    if total_blocked >= 1439:
+        return False
+
+    return True
+
+
 class DatabaseManager:
     """
     Unified database manager supporting production MySQL with resilient fallback
@@ -807,20 +868,28 @@ class DatabaseManager:
                 is_currently_reserved = (active_booking is not None)
                 has_upcoming_reservation = (next_booking is not None)
 
-                # Available Now: Physically empty, no active reservation right now, and no sensor error!
-                # (Crucial: Future bookings do NOT block current availability!)
+                # Available for Booking (Day-Level):
+                # Bay remains available for booking today if at least some bookable time remains today.
+                # Only decreases when the bay is booked for the entire day (1440 min).
+                today_str = now.strftime("%Y-%m-%d")
+                is_bookable_today = check_slot_bookable_today(slot_b_list, today_str)
+
+                # Available right now: Physically empty, no active reservation right now, and no sensor error!
                 is_available_now = (not is_physically_occupied and not is_currently_reserved and not is_sensor_error)
 
                 # Effective Display Status:
                 # 1. Occupied: Physical vehicle present (highest priority)
                 # 2. Sensor Error: Hardware error or timeout
-                # 3. Reserved: Active reservation right now and empty
-                # 4. Upcoming Reservation: Has future booking, empty now
-                # 5. Available: Clear, empty, ready for booking
+                # 3. Reserved (all-day): Fully booked for today
+                # 4. Reserved: Active reservation right now and empty
+                # 5. Upcoming Reservation: Has future booking, empty now
+                # 6. Available: Clear, empty, ready for booking
                 if is_physically_occupied:
                     effective_status = "Occupied"
                 elif is_sensor_error:
                     effective_status = "Sensor Error"
+                elif not is_bookable_today:
+                    effective_status = "Reserved"
                 elif is_currently_reserved:
                     effective_status = "Reserved"
                 elif has_upcoming_reservation:
@@ -839,6 +908,8 @@ class DatabaseManager:
                         availability_window = f"Occupied (Reserved until {str(active_booking['end_time'])[:5]})"
                     else:
                         availability_window = "Occupied by vehicle"
+                elif not is_bookable_today:
+                    availability_window = "Fully booked for today"
                 elif is_currently_reserved:
                     availability_window = f"Reserved until {str(active_booking['end_time'])[:5]}"
                 elif has_upcoming_reservation:
@@ -854,6 +925,8 @@ class DatabaseManager:
                     "is_physically_occupied": is_physically_occupied,
                     "is_currently_reserved": is_currently_reserved,
                     "has_upcoming_reservation": has_upcoming_reservation,
+                    "is_bookable_today": is_bookable_today,
+                    "is_available_for_booking": is_bookable_today,
                     "is_available_now": is_available_now,
                     "reservation_status": "Active Reservation" if is_currently_reserved else ("Upcoming Reservation" if has_upcoming_reservation else "None"),
                     "distance_cm": dist if not is_sensor_error else None,
@@ -898,7 +971,7 @@ class DatabaseManager:
             total_slots = len(computed_slots)
             physically_occupied = sum(1 for s in computed_slots if s["is_physically_occupied"])
             physical_available = total_slots - physically_occupied
-            available_now = sum(1 for s in computed_slots if s["is_available_now"])
+            available_for_booking = sum(1 for s in computed_slots if s["is_bookable_today"])
             sensor_errors = sum(1 for s in computed_slots if s["status"] == "Sensor Error")
             active_reservations = sum(1 for s in computed_slots if s["is_currently_reserved"])
             upcoming_reservations = sum(s["upcoming_count"] for s in computed_slots)
@@ -918,7 +991,8 @@ class DatabaseManager:
                 "physical_available": physical_available,
                 "physically_occupied": physically_occupied,
                 "booked_reserved": booked_reserved,
-                "available_now": available_now,
+                "available_for_booking": available_for_booking,
+                "available_now": available_for_booking,
                 "sensor_errors": sensor_errors,
                 "active_reservations": active_reservations,
                 "upcoming_reservations": upcoming_reservations,
