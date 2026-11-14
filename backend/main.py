@@ -20,7 +20,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Smart Parking System API",
     description="Full-stack IoT Smart Parking backend with ESP32 integration, MySQL persistence, and real-time dashboard state.",
-    version="2.0.0",
+    version="2.2.0",
     lifespan=lifespan,
 )
 
@@ -56,7 +56,9 @@ app.add_middleware(
 # Pydantic Schemas
 class SensorUpdateRequest(BaseModel):
     slot_id: int = Field(..., ge=1, le=3, description="Parking slot ID (1, 2, or 3)")
-    status: str = Field(..., description="Sensor physical state: 'Occupied', 'Empty', or 'Error'")
+    status: Optional[str] = Field(None, description="Sensor physical state: 'Occupied', 'Empty', or 'Error'")
+    occupied: Optional[bool] = Field(None, description="Boolean occupancy: true=Occupied, false=Empty")
+    is_occupied: Optional[bool] = Field(None, description="Alternative boolean occupancy")
     distance_cm: Optional[float] = Field(None, description="Ultrasonic distance in centimeters")
 
 
@@ -66,11 +68,14 @@ class BookingCreateRequest(BaseModel):
     duration_minutes: Optional[int] = Field(60, ge=1, le=1440, description="Duration in minutes (1 - 1440)")
 
 
+class BookingCreateRequestWithSlot(BookingCreateRequest):
+    slot_id: Optional[int] = Field(None, ge=1, le=3, description="Parking slot ID (1, 2, or 3)")
+
+
 class CancelSlotRequest(BaseModel):
     booking_id: Optional[str] = None
     date: Optional[str] = None
     time: Optional[str] = None
-
 
 
 # Dependency: Verify Hardware Sensor Token
@@ -86,8 +91,8 @@ def verify_sensor_token(
 
     provided_token = x_sensor_token or bearer_token or token
 
-    # Check secret token
-    if not provided_token or provided_token != SENSOR_API_TOKEN:
+    expected_token = SENSOR_API_TOKEN.strip() if SENSOR_API_TOKEN else "smartpark_esp32_secret_2026"
+    if not provided_token or provided_token.strip() != expected_token:
         raise HTTPException(
             status_code=401,
             detail="Unauthorized: Invalid or missing sensor authentication token."
@@ -105,15 +110,17 @@ def home():
     return {
         "system": "Smart Parking System",
         "status": "Online",
-        "version": "2.0.0",
+        "version": "2.2.0",
         "time": now.strftime("%Y-%m-%d %H:%M:%S"),
         "timezone": "Asia/Kolkata",
         "endpoints": {
             "health": "/health",
             "slots": "/slots",
+            "slot_availability": "/slots/{slot_id}/availability",
             "sensor_status": "/sensor/status",
             "sensor_update": "POST /sensor/update",
             "bookings": "/bookings",
+            "create_booking": "POST /bookings",
             "book_slot": "POST /book/{slot_id}",
             "cancel_booking": "DELETE /bookings/{booking_id}",
             "cancel_slot": "POST /cancel/{slot_id}",
@@ -160,7 +167,7 @@ def health_check():
 def get_slots():
     """
     Returns real-time slot states, physical sensor data, active bookings,
-    and accurate dashboard counts.
+    and independently calculated dashboard counts (separating physical from booking availability).
     """
     try:
         return db.get_slots_with_status()
@@ -169,31 +176,15 @@ def get_slots():
 
 
 @app.get("/slots/{slot_id}/intervals")
-def get_slot_intervals(slot_id: int, date: Optional[str] = Query(None)):
-    """Returns booked intervals for a slot on a given date to facilitate time window selection."""
+@app.get("/slots/{slot_id}/availability")
+def get_slot_availability_endpoint(slot_id: int, date: Optional[str] = Query(None)):
+    """Returns booked intervals, available time windows, and next available time for a slot on a given date."""
     if slot_id not in (1, 2, 3):
-        raise HTTPException(status_code=404, detail="Invalid slot ID.")
+        raise HTTPException(status_code=404, detail=f"Slot {slot_id} does not exist. Available slots: 1, 2, 3.")
     try:
-        bookings = db.get_bookings(slot_id=slot_id, status="ACTIVE")
-        if date:
-            bookings = [b for b in bookings if b.get("booking_date") == date]
-        intervals = [
-            {
-                "booking_id": b["booking_id"],
-                "date": b["booking_date"],
-                "start_time": str(b["start_time"])[:5],
-                "end_time": str(b["end_time"])[:5],
-                "duration_minutes": b["duration_minutes"],
-            }
-            for b in bookings
-        ]
-        return {
-            "slot_id": slot_id,
-            "date": date,
-            "booked_intervals": intervals,
-        }
+        return db.get_slot_availability(slot_id=slot_id, target_date_str=date)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error fetching intervals: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database error fetching availability: {str(e)}")
 
 
 @app.get("/sensor/status")
@@ -217,21 +208,31 @@ def update_sensor_status(
 ):
     """
     Receives physical ultrasonic sensor telemetry from ESP32.
-    Requires X-Sensor-Token header.
-    Normalizes statuses into 'Occupied', 'Empty', or 'Error'.
+    Accepts both string status ('Occupied', 'Empty', 'Error') and boolean ('occupied': true/false).
+    Requires X-Sensor-Token header or ?token query parameter.
     """
-    raw_status = data.status.strip().lower()
-
-    if raw_status in ("occupied", "full", "vehicle", "vehicle_detected", "present", "1"):
-        normalized_status = "Occupied"
-    elif raw_status in ("empty", "available", "vacant", "no_vehicle", "clear", "0"):
-        normalized_status = "Empty"
-    elif raw_status in ("error", "sensor_error", "timeout", "unknown", "disconnected", "-1"):
-        normalized_status = "Error"
+    # 1. Evaluate boolean inputs if provided
+    if data.occupied is not None:
+        normalized_status = "Occupied" if data.occupied else "Empty"
+    elif data.is_occupied is not None:
+        normalized_status = "Occupied" if data.is_occupied else "Empty"
+    elif data.status is not None:
+        raw_status = data.status.strip().lower()
+        if raw_status in ("occupied", "full", "vehicle", "vehicle_detected", "present", "1", "true"):
+            normalized_status = "Occupied"
+        elif raw_status in ("empty", "available", "vacant", "no_vehicle", "clear", "0", "false"):
+            normalized_status = "Empty"
+        elif raw_status in ("error", "sensor_error", "timeout", "unknown", "disconnected", "-1"):
+            normalized_status = "Error"
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid status. Valid values: 'Occupied', 'Empty', 'Error', or 'occupied': true/false."
+            )
     else:
         raise HTTPException(
             status_code=400,
-            detail="Invalid status. Valid values: 'Occupied', 'Empty', 'Error'."
+            detail="Missing sensor state. Provide 'status' string or 'occupied' boolean."
         )
 
     # Sanity check on distance readings
@@ -256,10 +257,34 @@ def update_sensor_status(
         raise HTTPException(status_code=500, detail=f"Failed to record sensor update: {str(e)}")
 
 
+@app.post("/bookings")
+def create_booking_direct(
+    body: Optional[BookingCreateRequestWithSlot] = None,
+    slot_id: Optional[int] = Query(None, ge=1, le=3),
+    date: Optional[str] = Query(None),
+    start_time: Optional[str] = Query(None),
+    duration_minutes: Optional[int] = Query(None),
+):
+    """
+    Direct POST /bookings endpoint for creating reservations.
+    Accepts JSON body or query parameters.
+    """
+    target_slot = (body and body.slot_id) or slot_id
+    if not target_slot or target_slot not in (1, 2, 3):
+        raise HTTPException(status_code=400, detail="Missing or invalid required parameter: 'slot_id' (must be 1, 2, or 3).")
+
+    return book_slot(
+        slot_id=target_slot,
+        body=body,
+        date=date,
+        start_time=start_time,
+        duration_minutes=duration_minutes,
+    )
+
+
 @app.post("/book/{slot_id}")
 def book_slot(
     slot_id: int,
-    # Support both JSON body and URL query params
     body: Optional[BookingCreateRequest] = None,
     date: Optional[str] = Query(None),
     start_time: Optional[str] = Query(None),
@@ -268,11 +293,11 @@ def book_slot(
     """
     Reserves a parking slot with strict 1-minute buffer and conflict checks.
     Accepts date, start_time, and duration_minutes via query parameters or JSON body.
+    Supports sequential valid bookings on the same slot without arbitrary daily limits.
     """
     if slot_id not in (1, 2, 3):
         raise HTTPException(status_code=404, detail=f"Slot {slot_id} does not exist. Available slots: 1, 2, 3.")
 
-    # Merge body and query params
     req_date = (body and body.date) or date
     req_start_time = (body and body.start_time) or start_time
     req_duration = (body and body.duration_minutes) or duration_minutes or 60
@@ -309,8 +334,10 @@ def list_bookings(
     status: Optional[str] = Query(None),
 ):
     """Lists all reservations with optional filters."""
+    clean_slot_id = slot_id if isinstance(slot_id, int) else None
+    clean_status = status if isinstance(status, str) else None
     try:
-        bookings = db.get_bookings(slot_id=slot_id, status=status)
+        bookings = db.get_bookings(slot_id=clean_slot_id, status=clean_status)
         return {
             "total_bookings": len(bookings),
             "bookings": bookings,
@@ -335,7 +362,7 @@ def get_booking(booking_id: str):
 
 @app.delete("/bookings/{booking_id}")
 def delete_booking(booking_id: str):
-    """Cancels a reservation using its unique booking ID."""
+    """Cancels a reservation using its unique booking ID. Preserves audit history in MySQL."""
     try:
         result = db.cancel_booking(booking_id)
         if not result:

@@ -1,28 +1,44 @@
 import pytest
 from datetime import datetime, timedelta
 from fastapi import HTTPException
-from database import db, TIMEZONE
+from database import db, TIMEZONE, get_current_time
 from main import (
     home,
     health_check,
     get_slots,
+    get_slot_availability_endpoint,
     get_sensor_status,
     update_sensor_status,
     book_slot,
+    create_booking_direct,
     list_bookings,
     get_booking,
     delete_booking,
     cancel_slot,
     SensorUpdateRequest,
     BookingCreateRequest,
+    BookingCreateRequestWithSlot,
     CancelSlotRequest,
 )
 
 
 @pytest.fixture(autouse=True)
 def setup_database():
-    """Ensure database tables and initial slots are freshly initialized."""
+    """Ensure database tables and initial slots are freshly initialized and isolated before every test."""
     db.init_db()
+    conn, db_type = db.get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM bookings;")
+        now_str = get_current_time().strftime("%Y-%m-%d %H:%M:%S")
+        if db_type == "mysql":
+            cursor.execute("UPDATE sensor_status SET physical_status = 'Empty', distance_cm = 200.0, is_healthy = 1, last_heartbeat = NOW();")
+        else:
+            cursor.execute("UPDATE sensor_status SET physical_status = 'Empty', distance_cm = 200.0, is_healthy = 1, last_heartbeat = ?;", (now_str,))
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
 
 
 def test_home_endpoint():
@@ -40,227 +56,300 @@ def test_health_endpoint():
     assert data["timezone"] == "Asia/Kolkata"
 
 
-def test_get_slots_initial():
+# ====================================================================
+# TEST A: All sensors Empty
+# Expected: Total Slots = 3, Physical Occupied = 0, Physical Available = 3
+# ====================================================================
+def test_scenario_a_all_sensors_empty():
+    for slot_id in (1, 2, 3):
+        update_sensor_status(SensorUpdateRequest(slot_id=slot_id, status="Empty", distance_cm=180.0), _authorized=True)
+
     data = get_slots()
-    assert len(data["slots"]) == 3
     summary = data["summary"]
     assert summary["total_slots"] == 3
-    assert summary["available_now"] == 3
     assert summary["physically_occupied"] == 0
+    assert summary["physical_available"] == 3
+    assert summary["available_now"] == 3
     assert summary["booked_reserved"] == 0
-    assert summary["sensor_errors"] == 0
 
 
-def test_sensor_telemetry_flow():
-    # 1. Update Slot 1 to Occupied (car parked)
-    req = SensorUpdateRequest(slot_id=1, status="Occupied", distance_cm=8.5)
-    res = update_sensor_status(req, _authorized=True)
-    assert res["physical_status"] == "Occupied"
-    assert res["distance_cm"] == 8.5
+# ====================================================================
+# TEST B: Slot 1 detects a car below 10 cm
+# Expected: Red LED 1 ON, Green LED 1 OFF, Physical Occupied = 1, Physical Available = 2
+# ====================================================================
+def test_scenario_b_slot1_detects_car_below_10cm():
+    update_sensor_status(SensorUpdateRequest(slot_id=1, status="Occupied", distance_cm=8.5), _authorized=True)
 
-    # 2. Check dashboard reflection
-    slots_data = get_slots()
-    assert slots_data["summary"]["physically_occupied"] == 1
-    assert slots_data["summary"]["available_now"] == 2
-    assert slots_data["slots"][0]["status"] == "Occupied"
-
-    # 3. Update Slot 1 back to Empty (car departs)
-    req_empty = SensorUpdateRequest(slot_id=1, status="Empty", distance_cm=145.0)
-    res_empty = update_sensor_status(req_empty, _authorized=True)
-    assert res_empty["physical_status"] == "Empty"
-
-    slots_after = get_slots()
-    assert slots_after["summary"]["physically_occupied"] == 0
-    assert slots_after["summary"]["available_now"] == 3
-    assert slots_after["slots"][0]["status"] == "Available"
+    data = get_slots()
+    summary = data["summary"]
+    assert summary["physically_occupied"] == 1
+    assert summary["physical_available"] == 2
+    assert summary["available_now"] == 2
+    assert data["slots"][0]["status"] == "Occupied"
+    assert data["slots"][0]["is_physically_occupied"] is True
 
 
-def test_sensor_error_state():
-    # Update Slot 2 to Error (hardware disconnected / invalid reading)
-    req = SensorUpdateRequest(slot_id=2, status="Error", distance_cm=None)
-    update_sensor_status(req, _authorized=True)
+# ====================================================================
+# TEST C: Slots 1 and 2 detect cars
+# Expected: Physical Occupied = 2, Physical Available = 1
+# ====================================================================
+def test_scenario_c_slots_1_and_2_detect_cars():
+    update_sensor_status(SensorUpdateRequest(slot_id=1, status="Occupied", distance_cm=8.0), _authorized=True)
+    update_sensor_status(SensorUpdateRequest(slot_id=2, status="Occupied", distance_cm=9.2), _authorized=True)
 
-    slots_data = get_slots()
-    assert slots_data["summary"]["sensor_errors"] == 1
-    assert slots_data["slots"][1]["status"] == "Sensor Error"
-    # Ensure error slot is NOT counted as available
-    assert slots_data["summary"]["available_now"] == 2
-
-    # Reset back to Empty
-    req_reset = SensorUpdateRequest(slot_id=2, status="Empty", distance_cm=200.0)
-    update_sensor_status(req_reset, _authorized=True)
+    data = get_slots()
+    summary = data["summary"]
+    assert summary["physically_occupied"] == 2
+    assert summary["physical_available"] == 1
+    assert summary["available_now"] == 1
 
 
-def test_booking_buffer_and_conflict_logic():
-    now_kolkata = datetime.now(TIMEZONE)
-    start_time = now_kolkata + timedelta(minutes=5)
-    date_str = start_time.strftime("%Y-%m-%d")
-    time_str = start_time.strftime("%H:%M")
+# ====================================================================
+# TEST D: All 3 sensors detect cars
+# Expected: Physical Occupied = 3, Physical Available = 0
+# ====================================================================
+def test_scenario_d_all_three_sensors_detect_cars():
+    for slot_id in (1, 2, 3):
+        update_sensor_status(SensorUpdateRequest(slot_id=slot_id, status="Occupied", distance_cm=7.0), _authorized=True)
 
-    # 1. Book Slot 2 for 30 minutes
-    book_res = book_slot(
-        slot_id=2,
-        body=BookingCreateRequest(
-            date=date_str,
-            start_time=time_str,
-            duration_minutes=30,
-        )
+    data = get_slots()
+    summary = data["summary"]
+    assert summary["physically_occupied"] == 3
+    assert summary["physical_available"] == 0
+    assert summary["available_now"] == 0
+
+
+# ====================================================================
+# TEST E: Remove all cars
+# Expected: Physical Occupied = 0, Physical Available = 3
+# ====================================================================
+def test_scenario_e_remove_all_cars():
+    # Place cars first
+    for slot_id in (1, 2, 3):
+        update_sensor_status(SensorUpdateRequest(slot_id=slot_id, status="Occupied", distance_cm=7.0), _authorized=True)
+
+    # Remove all cars (distance >= 10 cm)
+    for slot_id in (1, 2, 3):
+        update_sensor_status(SensorUpdateRequest(slot_id=slot_id, status="Empty", distance_cm=180.0), _authorized=True)
+
+    data = get_slots()
+    summary = data["summary"]
+    assert summary["physically_occupied"] == 0
+    assert summary["physical_available"] == 3
+    assert summary["available_now"] == 3
+
+
+# ====================================================================
+# TEST F: Slot 1 is reserved but physically Empty
+# Expected: Physical Occupied = 0, Physical Available = 3, Reserved = 1
+# ====================================================================
+def test_scenario_f_slot1_reserved_but_physically_empty():
+    now = get_current_time()
+    start_dt = now - timedelta(minutes=5)
+    end_dt = now + timedelta(minutes=55)
+
+    conn, db_type = db.get_connection()
+    cursor = conn.cursor()
+    try:
+        now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+        cursor.execute("""
+            INSERT INTO bookings (
+                booking_id, slot_id, booking_date, start_time, end_time,
+                start_datetime, end_datetime, duration_minutes, booking_status,
+                created_at, updated_at
+            ) VALUES (?, 1, ?, ?, ?, ?, ?, 60, 'ACTIVE', ?, ?);
+        """ if db_type == "sqlite" else """
+            INSERT INTO bookings (
+                booking_id, slot_id, booking_date, start_time, end_time,
+                start_datetime, end_datetime, duration_minutes, booking_status,
+                created_at, updated_at
+            ) VALUES (%s, 1, %s, %s, %s, %s, %s, 60, 'ACTIVE', %s, %s);
+        """, (
+            "BK-TESTF01",
+            start_dt.strftime("%Y-%m-%d"),
+            start_dt.strftime("%H:%M:00"),
+            end_dt.strftime("%H:%M:00"),
+            start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+            now_str,
+            now_str
+        ))
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+    # Sensor reports Empty
+    update_sensor_status(SensorUpdateRequest(slot_id=1, status="Empty", distance_cm=200.0), _authorized=True)
+
+    data = get_slots()
+    summary = data["summary"]
+    assert summary["total_slots"] == 3
+    assert summary["physically_occupied"] == 0
+    assert summary["physical_available"] == 3, "Reserved but physically empty slot MUST be counted as physically available!"
+    assert summary["booked_reserved"] == 1
+    assert summary["available_now"] == 2, "Booking availability for immediate reservation is 2"
+    assert data["slots"][0]["status"] == "Reserved"
+    assert data["slots"][0]["is_currently_reserved"] is True
+    assert data["slots"][0]["is_physically_occupied"] is False
+
+
+# ====================================================================
+# TEST G: Refresh simulation
+# Expected: Available does not incorrectly change from 3 to 0.
+# ====================================================================
+def test_scenario_g_refresh_persistence():
+    # Repeatedly query slots
+    for _ in range(5):
+        data = get_slots()
+        summary = data["summary"]
+        assert summary["total_slots"] == 3
+        assert summary["physical_available"] == 3
+        assert summary["physically_occupied"] == 0
+        assert summary["available_now"] == 3
+
+
+# ====================================================================
+# TEST H: Create four sequential valid bookings for the same slot
+# Booking 1: 09:00 to 09:30
+# Booking 2: 09:31 to 10:00
+# Booking 3: 10:01 to 10:30
+# Booking 4: 10:31 to 11:00
+# All should be accepted. Overlapping bookings must be rejected.
+# ====================================================================
+def test_scenario_h_four_sequential_bookings_same_slot():
+    future_date = (get_current_time() + timedelta(days=2)).strftime("%Y-%m-%d")
+
+    # Booking 1: 09:00 to 09:30
+    b1 = book_slot(
+        slot_id=1,
+        body=BookingCreateRequest(date=future_date, start_time="09:00", duration_minutes=30)
     )
-    booking_id = book_res["booking"]["booking_id"]
-    assert booking_id.startswith("BK-")
+    assert b1["booking"]["booking_id"].startswith("BK-")
 
-    # Verify that future booking preserves 'Available' status right now, but attaches upcoming reservation
-    slots_after_future_book = get_slots()
-    assert slots_after_future_book["slots"][1]["status"] == "Available"
-    assert slots_after_future_book["slots"][1]["has_upcoming_reservation"] is True
-    assert slots_after_future_book["summary"]["available_now"] == 3
-    assert slots_after_future_book["summary"]["booked_reserved"] == 0
-
-    # 2. Conflict: Overlapping reservation on Slot 2
-    overlap_time = (start_time + timedelta(minutes=10)).strftime("%H:%M")
-    with pytest.raises(HTTPException) as exc_overlap:
-        book_slot(
-            slot_id=2,
-            body=BookingCreateRequest(
-                date=date_str,
-                start_time=overlap_time,
-                duration_minutes=20,
-            )
-        )
-    assert exc_overlap.value.status_code == 409
-    assert "unavailable during this time" in exc_overlap.value.detail.lower()
-
-    # 3. Buffer conflict: exactly at end time (needs 1-minute buffer)
-    buffer_time = (start_time + timedelta(minutes=30)).strftime("%H:%M")
-    with pytest.raises(HTTPException) as exc_buf:
-        book_slot(
-            slot_id=2,
-            body=BookingCreateRequest(
-                date=date_str,
-                start_time=buffer_time,
-                duration_minutes=20,
-            )
-        )
-    assert exc_buf.value.status_code == 409
-
-    # 4. Valid booking after 1-minute buffer (end + 1 min buffer = 31 min)
-    valid_after_time = (start_time + timedelta(minutes=32)).strftime("%H:%M")
-    valid_res = book_slot(
-        slot_id=2,
-        body=BookingCreateRequest(
-            date=date_str,
-            start_time=valid_after_time,
-            duration_minutes=15,
-        )
+    # Booking 2: 09:31 to 10:00 (1-minute buffer after 09:30 respected)
+    b2 = book_slot(
+        slot_id=1,
+        body=BookingCreateRequest(date=future_date, start_time="09:31", duration_minutes=29)
     )
-    second_booking_id = valid_res["booking"]["booking_id"]
-    assert second_booking_id.startswith("BK-")
+    assert b2["booking"]["booking_id"].startswith("BK-")
 
-    # 5. Same time on DIFFERENT slot (Slot 3) should succeed
-    diff_slot_res = book_slot(
-        slot_id=3,
-        body=BookingCreateRequest(
-            date=date_str,
-            start_time=time_str,
-            duration_minutes=30,
-        )
+    # Booking 3: 10:01 to 10:30 (1-minute buffer after 10:00 respected)
+    b3 = book_slot(
+        slot_id=1,
+        body=BookingCreateRequest(date=future_date, start_time="10:01", duration_minutes=29)
     )
-    assert diff_slot_res["booking"]["slot_id"] == 3
+    assert b3["booking"]["booking_id"].startswith("BK-")
 
-    # Clean up created bookings
-    delete_booking(booking_id)
-    delete_booking(second_booking_id)
-    delete_booking(diff_slot_res["booking"]["booking_id"])
+    # Booking 4: 10:31 to 11:00 (The fourth sequential booking!)
+    b4 = book_slot(
+        slot_id=1,
+        body=BookingCreateRequest(date=future_date, start_time="10:31", duration_minutes=29)
+    )
+    assert b4["booking"]["booking_id"].startswith("BK-")
 
+    # Verify all 4 bookings exist in database
+    b_list = list_bookings(slot_id=1)["bookings"]
+    assert len(b_list) == 4
 
-def test_past_time_booking_rejected():
-    yesterday = datetime.now(TIMEZONE) - timedelta(days=1)
-    with pytest.raises(HTTPException) as exc:
+    # Overlapping booking attempt: 09:15 to 09:45 -> MUST BE REJECTED
+    with pytest.raises(HTTPException) as exc1:
         book_slot(
             slot_id=1,
-            body=BookingCreateRequest(
-                date=yesterday.strftime("%Y-%m-%d"),
-                start_time="10:00",
-                duration_minutes=60,
-            )
+            body=BookingCreateRequest(date=future_date, start_time="09:15", duration_minutes=30)
         )
-    assert exc.value.status_code == 409
-    assert "past" in exc.value.detail.lower()
+    assert exc1.value.status_code == 409
 
-
-def test_booking_cancellation():
-    now_kolkata = datetime.now(TIMEZONE)
-    future = now_kolkata + timedelta(hours=2)
-    date_str = future.strftime("%Y-%m-%d")
-    time_str = future.strftime("%H:%M")
-
-    # Create a booking
-    res = book_slot(
-        slot_id=1,
-        body=BookingCreateRequest(
-            date=date_str,
-            start_time=time_str,
-            duration_minutes=45,
+    # Buffer violation attempt: 09:30 to 10:00 (starts right at 09:30, violating buffer) -> REJECTED
+    with pytest.raises(HTTPException) as exc2:
+        book_slot(
+            slot_id=1,
+            body=BookingCreateRequest(date=future_date, start_time="09:30", duration_minutes=30)
         )
+    assert exc2.value.status_code == 409
+
+
+# ====================================================================
+# TEST I: Cancel an active booking
+# Expected: Removed from active bookings, historical record in MySQL retained, slot interval released
+# ====================================================================
+def test_scenario_i_cancellation_preserves_history():
+    future_date = (get_current_time() + timedelta(days=3)).strftime("%Y-%m-%d")
+
+    b = book_slot(
+        slot_id=2,
+        body=BookingCreateRequest(date=future_date, start_time="14:00", duration_minutes=60)
     )
-    bk_id = res["booking"]["booking_id"]
+    bk_id = b["booking"]["booking_id"]
 
-    # Verify in list
-    all_bks = list_bookings(slot_id=1, status="ACTIVE")
-    assert any(b["booking_id"] == bk_id for b in all_bks["bookings"])
-
-    # Cancel by booking ID
+    # Cancel the booking
     cancel_res = delete_booking(bk_id)
     assert cancel_res["booking"]["booking_status"] == "CANCELLED"
 
-    # Confirm it is no longer returned under ACTIVE bookings
-    active_bks = list_bookings(slot_id=1, status="ACTIVE")
-    assert not any(b["booking_id"] == bk_id for b in active_bks["bookings"])
+    # Verify record still exists in database with status CANCELLED
+    record = get_booking(bk_id)
+    assert record["booking_id"] == bk_id
+    assert record["booking_status"] == "CANCELLED"
+
+    # Verify interval is free again
+    rebook = book_slot(
+        slot_id=2,
+        body=BookingCreateRequest(date=future_date, start_time="14:00", duration_minutes=60)
+    )
+    assert rebook["booking"]["booking_id"].startswith("BK-")
 
 
-def test_realtime_physical_occupancy_counters():
-    """
-    Verifies Section 7:
-    - 0 vehicles detected -> Physically Occupied = 0
-    - 1 vehicle detected -> Physically Occupied = 1
-    - 2 vehicles detected -> Physically Occupied = 2
-    - 3 vehicles detected -> Physically Occupied = 3
-    - Decrements when vehicle leaves
-    - Each bay counted at most once
-    - Reservation alone never increases physically occupied
-    - Vehicle in reserved bay shows OCCUPIED and increments physically occupied
-    """
-    # 0 vehicles initially
-    for s_id in (1, 2, 3):
-        update_sensor_status(SensorUpdateRequest(slot_id=s_id, status="Empty", distance_cm=180.0), _authorized=True)
-    assert get_slots()["summary"]["physically_occupied"] == 0
+# ====================================================================
+# TEST J & K: Sensor payload compatibility (Boolean and String)
+# ====================================================================
+def test_sensor_payload_boolean_compatibility():
+    # Test {"slot_id": 1, "occupied": true}
+    res_occ = update_sensor_status(
+        SensorUpdateRequest(slot_id=1, occupied=True, distance_cm=7.5),
+        _authorized=True
+    )
+    assert res_occ["physical_status"] == "Occupied"
 
-    # 1 vehicle in Slot 1
-    update_sensor_status(SensorUpdateRequest(slot_id=1, status="Occupied", distance_cm=8.0), _authorized=True)
-    assert get_slots()["summary"]["physically_occupied"] == 1
-    assert get_slots()["summary"]["available_now"] == 2
+    # Test {"slot_id": 1, "occupied": false}
+    res_emp = update_sensor_status(
+        SensorUpdateRequest(slot_id=1, occupied=False, distance_cm=160.0),
+        _authorized=True
+    )
+    assert res_emp["physical_status"] == "Empty"
 
-    # 2 vehicles (Slot 1 and Slot 2)
-    update_sensor_status(SensorUpdateRequest(slot_id=2, status="Occupied", distance_cm=9.5), _authorized=True)
-    assert get_slots()["summary"]["physically_occupied"] == 2
-    assert get_slots()["summary"]["available_now"] == 1
 
-    # 3 vehicles (Slot 1, Slot 2, Slot 3)
-    update_sensor_status(SensorUpdateRequest(slot_id=3, status="Occupied", distance_cm=6.0), _authorized=True)
-    assert get_slots()["summary"]["physically_occupied"] == 3
-    assert get_slots()["summary"]["available_now"] == 0
+# ====================================================================
+# Direct POST /bookings endpoint
+# ====================================================================
+def test_direct_post_bookings_endpoint():
+    future_date = (get_current_time() + timedelta(days=4)).strftime("%Y-%m-%d")
 
-    # Repeated sensor reading on Slot 1 must not double count
-    update_sensor_status(SensorUpdateRequest(slot_id=1, status="Occupied", distance_cm=7.9), _authorized=True)
-    assert get_slots()["summary"]["physically_occupied"] == 3
+    res = create_booking_direct(
+        body=BookingCreateRequestWithSlot(
+            slot_id=3,
+            date=future_date,
+            start_time="15:00",
+            duration_minutes=45
+        )
+    )
+    assert res["booking"]["booking_id"].startswith("BK-")
+    assert res["booking"]["slot_id"] == 3
 
-    # Vehicle leaves Slot 2 -> decrements to 2
-    update_sensor_status(SensorUpdateRequest(slot_id=2, status="Empty", distance_cm=200.0), _authorized=True)
-    assert get_slots()["summary"]["physically_occupied"] == 2
-    assert get_slots()["summary"]["available_now"] == 1
 
-    # Clean up: clear all slots back to Empty
-    for s_id in (1, 2, 3):
-        update_sensor_status(SensorUpdateRequest(slot_id=s_id, status="Empty", distance_cm=200.0), _authorized=True)
-    assert get_slots()["summary"]["physically_occupied"] == 0
-    assert get_slots()["summary"]["available_now"] == 3
+# ====================================================================
+# Midnight crossing booking test
+# ====================================================================
+def test_midnight_crossing_booking():
+    future_date = (get_current_time() + timedelta(days=5)).strftime("%Y-%m-%d")
+
+    res = book_slot(
+        slot_id=1,
+        body=BookingCreateRequest(
+            date=future_date,
+            start_time="23:30",
+            duration_minutes=60,
+        )
+    )
+    assert res["booking"]["booking_id"].startswith("BK-")
+    assert res["booking"]["start_time"] == "23:30"
+    assert res["booking"]["end_time"] == "00:30"

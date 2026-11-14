@@ -2,6 +2,7 @@ import os
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Dict, Any
 
 try:
     from zoneinfo import ZoneInfo
@@ -11,7 +12,10 @@ except Exception:
 
 import pymysql
 from pymysql.cursors import DictCursor
+
 BUFFER_MINUTES = 1
+# Default SENSOR_TIMEOUT_SECONDS to 0 (disabled) so idle sensors are not falsely marked as errors
+SENSOR_TIMEOUT_SECONDS = int(os.getenv("SENSOR_TIMEOUT_SECONDS", "0"))
 
 MYSQL_HOST = os.getenv("MYSQL_HOST")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
@@ -27,6 +31,25 @@ def is_mysql_configured() -> bool:
 def get_current_time() -> datetime:
     """Returns the current timezone-aware datetime in Asia/Kolkata."""
     return datetime.now(TIMEZONE)
+
+
+def parse_datetime_to_kolkata(dt_val: Any) -> Optional[datetime]:
+    """Safely converts string or datetime to Asia/Kolkata timezone-aware datetime."""
+    if dt_val is None:
+        return None
+    if isinstance(dt_val, datetime):
+        if dt_val.tzinfo is None:
+            return dt_val.replace(tzinfo=TIMEZONE)
+        return dt_val.astimezone(TIMEZONE)
+    s = str(dt_val).strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(s[:19], fmt).replace(tzinfo=TIMEZONE)
+        except ValueError:
+            continue
+    return None
 
 
 class DatabaseManager:
@@ -54,7 +77,6 @@ class DatabaseManager:
                 )
                 return conn, "mysql"
             except Exception as e:
-                # If MySQL fails to connect, fallback to SQLite and log warning
                 print(f"[DB WARNING] Failed to connect to MySQL ({e}). Falling back to SQLite.")
                 self.use_mysql = False
 
@@ -66,6 +88,7 @@ class DatabaseManager:
         """Initializes tables and seeds initial 3 parking slots."""
         conn, db_type = self.get_connection()
         cursor = conn.cursor()
+        now_str = get_current_time().strftime("%Y-%m-%d %H:%M:%S")
 
         try:
             if db_type == "mysql":
@@ -75,7 +98,7 @@ class DatabaseManager:
                         slot_number VARCHAR(16) NOT NULL,
                         is_active TINYINT(1) NOT NULL DEFAULT 1,
                         created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
                 """)
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS sensor_status (
@@ -85,7 +108,7 @@ class DatabaseManager:
                         last_heartbeat DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
                         is_healthy TINYINT(1) NOT NULL DEFAULT 1,
                         FOREIGN KEY (slot_id) REFERENCES parking_slots(id) ON DELETE CASCADE
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
                 """)
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS sensor_logs (
@@ -94,8 +117,9 @@ class DatabaseManager:
                         status VARCHAR(20) NOT NULL,
                         distance_cm FLOAT DEFAULT NULL,
                         recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        INDEX idx_slot_rec (slot_id, recorded_at)
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                        INDEX idx_slot_rec (slot_id, recorded_at),
+                        FOREIGN KEY (slot_id) REFERENCES parking_slots(id) ON DELETE CASCADE
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
                 """)
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS bookings (
@@ -112,8 +136,31 @@ class DatabaseManager:
                         updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                         INDEX idx_slot_time (slot_id, booking_status, start_datetime, end_datetime),
                         FOREIGN KEY (slot_id) REFERENCES parking_slots(id) ON DELETE CASCADE
-                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
                 """)
+
+                # Auto-migration: Drop any legacy UNIQUE constraints on bookings table
+                # that would prevent multiple bookings on the same slot_id or slot_id+date
+                try:
+                    cursor.execute("""
+                        SELECT DISTINCT INDEX_NAME
+                        FROM information_schema.statistics
+                        WHERE TABLE_SCHEMA = DATABASE()
+                          AND TABLE_NAME = 'bookings'
+                          AND NON_UNIQUE = 0
+                          AND INDEX_NAME != 'PRIMARY';
+                    """)
+                    unique_indices = cursor.fetchall()
+                    for u_idx in unique_indices:
+                        idx_name = u_idx.get("INDEX_NAME") if isinstance(u_idx, dict) else u_idx[0]
+                        if idx_name:
+                            try:
+                                cursor.execute(f"ALTER TABLE bookings DROP INDEX `{idx_name}`;")
+                                print(f"[DB MIGRATION] Dropped unique index '{idx_name}' from bookings table.")
+                            except Exception as drop_err:
+                                print(f"[DB MIGRATION WARNING] Could not drop index {idx_name}: {drop_err}")
+                except Exception as check_err:
+                    print(f"[DB MIGRATION NOTICE] Index check notice: {check_err}")
 
                 for slot_id in (1, 2, 3):
                     cursor.execute("""
@@ -123,9 +170,9 @@ class DatabaseManager:
                     """, (slot_id, f"Slot {slot_id}"))
                     cursor.execute("""
                         INSERT INTO sensor_status (slot_id, physical_status, distance_cm, last_heartbeat, is_healthy)
-                        VALUES (%s, 'Empty', 200.0, NOW(), 1)
-                        ON DUPLICATE KEY UPDATE physical_status=physical_status;
-                    """, (slot_id,))
+                        VALUES (%s, 'Empty', 200.0, %s, 1)
+                        ON DUPLICATE KEY UPDATE slot_id=slot_id;
+                    """, (slot_id, now_str))
             else:
                 cursor.execute("""
                     CREATE TABLE IF NOT EXISTS parking_slots (
@@ -178,8 +225,8 @@ class DatabaseManager:
                     """, (slot_id, f"Slot {slot_id}"))
                     cursor.execute("""
                         INSERT OR IGNORE INTO sensor_status (slot_id, physical_status, distance_cm, last_heartbeat, is_healthy)
-                        VALUES (?, 'Empty', 200.0, datetime('now'), 1);
-                    """, (slot_id,))
+                        VALUES (?, 'Empty', 200.0, ?, 1);
+                    """, (slot_id, now_str))
 
             conn.commit()
         finally:
@@ -242,8 +289,8 @@ class DatabaseManager:
         """
         Creates a new reservation with safe concurrency, past-time checks,
         and strict 1-minute buffer conflict detection.
+        Supports unlimited sequential valid bookings on the same slot.
         """
-        # Validate slot existence
         if slot_id not in (1, 2, 3):
             raise ValueError(f"Invalid parking slot {slot_id}. Must be 1, 2, or 3.")
 
@@ -252,14 +299,14 @@ class DatabaseManager:
 
         # Parse date and start time in Asia/Kolkata
         try:
-            start_dt = datetime.strptime(f"{date_str} {start_time_str}", "%Y-%m-%d %H:%M").replace(tzinfo=TIMEZONE)
+            start_dt = datetime.strptime(f"{date_str} {start_time_str[:5]}", "%Y-%m-%d %H:%M").replace(tzinfo=TIMEZONE)
         except ValueError:
             raise ValueError("Invalid date or time format. Expected YYYY-MM-DD and HH:MM.")
 
         now_kolkata = get_current_time()
-        # Allow a small 60-second leeway for clock skew if user selects right now
-        if start_dt < (now_kolkata - timedelta(seconds=60)):
-            raise ValueError(f"Cannot book a time in the past. Current time in Asia/Kolkata is {now_kolkata.strftime('%Y-%m-%d %H:%M')}.")
+        # Allow bookings for today and future dates
+        if start_dt.date() < now_kolkata.date():
+            raise ValueError(f"Cannot book a past date. Selected date is {date_str}, current date in Asia/Kolkata is {now_kolkata.strftime('%Y-%m-%d')}.")
 
         end_dt = start_dt + timedelta(minutes=duration_minutes)
 
@@ -267,17 +314,7 @@ class DatabaseManager:
         cursor = conn.cursor()
 
         try:
-            # Check physical sensor if booking starts immediately
-            if start_dt <= (now_kolkata + timedelta(minutes=1)):
-                if db_type == "mysql":
-                    cursor.execute("SELECT physical_status FROM sensor_status WHERE slot_id = %s FOR UPDATE;", (slot_id,))
-                else:
-                    cursor.execute("SELECT physical_status FROM sensor_status WHERE slot_id = ?;", (slot_id,))
-                sensor_row = cursor.fetchone()
-                if sensor_row and dict(sensor_row).get("physical_status") == "Occupied":
-                    raise ValueError(f"Slot {slot_id} is currently physically occupied by a vehicle.")
-
-            # Check existing ACTIVE bookings for this slot
+            # Check existing ACTIVE bookings for this slot (with transaction lock on MySQL)
             if db_type == "mysql":
                 cursor.execute("""
                     SELECT booking_id, booking_date, start_time, end_time, start_datetime, end_datetime
@@ -297,27 +334,23 @@ class DatabaseManager:
 
             for b in existing_bookings:
                 b_dict = dict(b)
-                # Parse existing start and end datetimes
-                s_raw = b_dict["start_datetime"]
-                e_raw = b_dict["end_datetime"]
+                ex_start = parse_datetime_to_kolkata(b_dict["start_datetime"])
+                ex_end = parse_datetime_to_kolkata(b_dict["end_datetime"])
 
-                if isinstance(s_raw, str):
-                    ex_start = datetime.strptime(s_raw[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=TIMEZONE)
-                    ex_end = datetime.strptime(e_raw[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=TIMEZONE)
-                else:
-                    ex_start = s_raw.replace(tzinfo=TIMEZONE)
-                    ex_end = e_raw.replace(tzinfo=TIMEZONE)
+                if not ex_start or not ex_end:
+                    continue
 
                 buffered_ex_start = ex_start - buffer_td
                 buffered_ex_end = ex_end + buffer_td
 
                 # Conflict occurs if [start_dt, end_dt] overlaps [buffered_ex_start, buffered_ex_end]
+                # Overlap condition: start_dt < buffered_ex_end and end_dt > buffered_ex_start
                 if start_dt < buffered_ex_end and end_dt > buffered_ex_start:
                     raise ValueError(
                         f"Slot {slot_id} is unavailable during this time. "
                         f"Existing reservation: {ex_start.strftime('%Y-%m-%d %H:%M')} - "
-                        f"{ex_end.strftime('%H:%M')} (plus 1-min buffer). "
-                        "Please choose another slot or time."
+                        f"{ex_end.strftime('%H:%M')} (plus 1-min safety buffer). "
+                        "Please choose another slot or non-overlapping time."
                     )
 
             booking_uuid = f"BK-{uuid.uuid4().hex[:8].upper()}"
@@ -368,24 +401,18 @@ class DatabaseManager:
             conn.close()
 
     def cancel_booking(self, booking_id: str):
-        """Cancels a booking by its unique booking ID."""
+        """Cancels a booking by its unique booking ID. Preserves history in database."""
         conn, db_type = self.get_connection()
         cursor = conn.cursor()
         now_str = get_current_time().strftime("%Y-%m-%d %H:%M:%S")
 
         try:
-            if db_type == "mysql":
-                cursor.execute("""
-                    SELECT booking_id, slot_id, booking_status
-                    FROM bookings
-                    WHERE booking_id = %s;
-                """, (booking_id,))
-            else:
-                cursor.execute("""
-                    SELECT booking_id, slot_id, booking_status
-                    FROM bookings
-                    WHERE booking_id = ?;
-                """, (booking_id,))
+            param_ph = "%s" if db_type == "mysql" else "?"
+            cursor.execute(f"""
+                SELECT booking_id, slot_id, booking_status, booking_date, start_time, end_time, duration_minutes
+                FROM bookings
+                WHERE booking_id = {param_ph};
+            """, (booking_id,))
 
             row = cursor.fetchone()
             if not row:
@@ -395,21 +422,17 @@ class DatabaseManager:
             if b_dict["booking_status"] == "CANCELLED":
                 return b_dict
 
-            if db_type == "mysql":
-                cursor.execute("""
-                    UPDATE bookings
-                    SET booking_status = 'CANCELLED', updated_at = %s
-                    WHERE booking_id = %s;
-                """, (now_str, booking_id))
-            else:
-                cursor.execute("""
-                    UPDATE bookings
-                    SET booking_status = 'CANCELLED', updated_at = ?
-                    WHERE booking_id = ?;
-                """, (now_str, booking_id))
+            cursor.execute(f"""
+                UPDATE bookings
+                SET booking_status = 'CANCELLED', updated_at = {param_ph}
+                WHERE booking_id = {param_ph};
+            """, (now_str, booking_id))
 
             conn.commit()
             b_dict["booking_status"] = "CANCELLED"
+            for k in ("start_time", "end_time", "booking_date"):
+                if b_dict.get(k) is not None:
+                    b_dict[k] = str(b_dict[k])
             return b_dict
         finally:
             cursor.close()
@@ -425,21 +448,16 @@ class DatabaseManager:
             if booking_id:
                 return self.cancel_booking(booking_id)
 
-            # Look up active booking by date and start_time
-            query = """
-                SELECT booking_id, slot_id, booking_status
-                FROM bookings
-                WHERE slot_id = {param} AND booking_status = 'ACTIVE'
-            """.format(param="%s" if db_type == "mysql" else "?")
+            param_ph = "%s" if db_type == "mysql" else "?"
+            query = f"SELECT booking_id, slot_id, booking_status FROM bookings WHERE slot_id = {param_ph} AND booking_status = 'ACTIVE'"
             params = [slot_id]
 
             if date:
-                query += " AND booking_date = {param}".format(param="%s" if db_type == "mysql" else "?")
+                query += f" AND booking_date = {param_ph}"
                 params.append(date)
             if time:
-                # support HH:MM or HH:MM:SS
                 time_like = f"{time[:5]}%"
-                query += " AND start_time LIKE {param}".format(param="%s" if db_type == "mysql" else "?")
+                query += f" AND start_time LIKE {param_ph}"
                 params.append(time_like)
 
             query += " ORDER BY start_datetime ASC LIMIT 1;"
@@ -452,18 +470,11 @@ class DatabaseManager:
             b_dict = dict(row)
             target_id = b_dict["booking_id"]
 
-            if db_type == "mysql":
-                cursor.execute("""
-                    UPDATE bookings
-                    SET booking_status = 'CANCELLED', updated_at = %s
-                    WHERE booking_id = %s;
-                """, (now_str, target_id))
-            else:
-                cursor.execute("""
-                    UPDATE bookings
-                    SET booking_status = 'CANCELLED', updated_at = ?
-                    WHERE booking_id = ?;
-                """, (now_str, target_id))
+            cursor.execute(f"""
+                UPDATE bookings
+                SET booking_status = 'CANCELLED', updated_at = {param_ph}
+                WHERE booking_id = {param_ph};
+            """, (now_str, target_id))
 
             conn.commit()
             b_dict["booking_status"] = "CANCELLED"
@@ -482,10 +493,10 @@ class DatabaseManager:
             params = []
             param_ph = "%s" if db_type == "mysql" else "?"
 
-            if slot_id:
+            if slot_id is not None and isinstance(slot_id, int):
                 query += f" AND slot_id = {param_ph}"
                 params.append(slot_id)
-            if status:
+            if status is not None and isinstance(status, str):
                 query += f" AND booking_status = {param_ph}"
                 params.append(status)
 
@@ -496,7 +507,6 @@ class DatabaseManager:
             results = []
             for r in rows:
                 item = dict(r)
-                # Normalize time/datetime fields for JSON serialization
                 for k in ("start_time", "end_time", "start_datetime", "end_datetime", "booking_date", "created_at", "updated_at"):
                     if item.get(k) is not None:
                         item[k] = str(item[k])
@@ -524,18 +534,142 @@ class DatabaseManager:
             cursor.close()
             conn.close()
 
+    def get_slot_availability(self, slot_id: int, target_date_str: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Calculates booked intervals, available time windows, and the next available
+        time for a slot on a given date (enforcing 1-minute safety buffers).
+        Correctly handles midnight transitions.
+        """
+        now = get_current_time()
+        today_str = now.strftime("%Y-%m-%d")
+        date_str = target_date_str or today_str
+
+        all_bookings = self.get_bookings(slot_id=slot_id, status="ACTIVE")
+
+        # Filter bookings that overlap the target date
+        intervals = []
+        blocked_ranges = []
+
+        for b in all_bookings:
+            s_dt = parse_datetime_to_kolkata(b.get("start_datetime"))
+            e_dt = parse_datetime_to_kolkata(b.get("end_datetime"))
+
+            if not s_dt or not e_dt:
+                continue
+
+            s_date = s_dt.strftime("%Y-%m-%d")
+            e_date = e_dt.strftime("%Y-%m-%d")
+
+            # Check if this booking overlaps the target date
+            if s_date != date_str and e_date != date_str:
+                continue
+
+            # Calculate minutes within target date
+            if s_date == date_str:
+                s_min = s_dt.hour * 60 + s_dt.minute
+                s_raw = f"{s_dt.hour:02d}:{s_dt.minute:02d}"
+            else:
+                s_min = 0 # Started previous day
+                s_raw = "00:00"
+
+            if e_date == date_str:
+                e_min = e_dt.hour * 60 + e_dt.minute
+                e_raw = f"{e_dt.hour:02d}:{e_dt.minute:02d}"
+            else:
+                e_min = 1440 # Continues into next day
+                e_raw = "23:59"
+
+            duration_val = int(b.get("duration_minutes") or (e_min - s_min if e_min > s_min else 60))
+
+            intervals.append({
+                "booking_id": b["booking_id"],
+                "date": date_str,
+                "start_time": s_raw,
+                "end_time": e_raw,
+                "duration_minutes": duration_val,
+            })
+            # Add 1-minute buffer to blocked interval
+            blocked_ranges.append((max(0, s_min - BUFFER_MINUTES), min(1440, e_min + BUFFER_MINUTES)))
+
+        # Merge overlapping blocked ranges
+        blocked_ranges.sort()
+        merged_blocks = []
+        for start, end in blocked_ranges:
+            if not merged_blocks or merged_blocks[-1][1] < start:
+                merged_blocks.append([start, end])
+            else:
+                merged_blocks[-1][1] = max(merged_blocks[-1][1], end)
+
+        # Compute free windows
+        available_windows = []
+        cur_min = 0
+        for b_start, b_end in merged_blocks:
+            if b_start > cur_min:
+                start_h = cur_min // 60
+                start_m = cur_min % 60
+                end_h = b_start // 60
+                end_m = b_start % 60
+                available_windows.append({
+                    "start_time": f"{start_h:02d}:{start_m:02d}",
+                    "end_time": f"{end_h:02d}:{end_m:02d}",
+                    "duration_minutes": b_start - cur_min,
+                })
+            cur_min = max(cur_min, b_end)
+
+        if cur_min < 1440:
+            start_h = cur_min // 60
+            start_m = cur_min % 60
+            available_windows.append({
+                "start_time": f"{start_h:02d}:{start_m:02d}",
+                "end_time": "23:59",
+                "duration_minutes": 1440 - cur_min,
+            })
+
+        # Calculate next available time
+        next_available_time = "Available Now"
+        if date_str == today_str:
+            now_minute = now.hour * 60 + now.minute
+            inside_block = None
+            for b_start, b_end in merged_blocks:
+                if b_start <= now_minute < b_end:
+                    inside_block = b_end
+                    break
+
+            if inside_block is not None:
+                if inside_block < 1440:
+                    next_h = inside_block // 60
+                    next_m = inside_block % 60
+                    next_available_time = f"{next_h:02d}:{next_m:02d}"
+                else:
+                    next_available_time = "Fully booked for today"
+            else:
+                next_available_time = "Available Now"
+        else:
+            if available_windows:
+                next_available_time = available_windows[0]["start_time"]
+            else:
+                next_available_time = "Fully booked for this date"
+
+        return {
+            "slot_id": slot_id,
+            "date": date_str,
+            "booked_intervals": intervals,
+            "available_windows": available_windows,
+            "next_available_time": next_available_time,
+        }
+
     def get_slots_with_status(self):
         """
         Computes accurate slot states and dashboard metrics:
         - Physically Occupied: Sensor detects car right now
-        - Booked/Reserved: Active reservation right now
-        - Sensor Error: Sensor state is 'Error' or missing
-        - Available: Neither occupied nor reserved nor in sensor error
+        - Physical Available: Total Slots - Physically Occupied (Empty bays)
+        - Reserved: Active reservation covering current time, bay empty
+        - Upcoming Reservation: Future reservation exists, bay empty now
+        - Sensor Error: Sensor state is 'Error'
+        - Available Now / Ready to Book: Neither physically occupied, nor reserved right now, nor sensor error
         """
         now = get_current_time()
-        now_str = now.strftime("%Y-%m-%d %H:%M:%S")
-
-        conn, db_type = self.get_connection()
+        conn, _ = self.get_connection()
         cursor = conn.cursor()
 
         try:
@@ -570,6 +704,18 @@ class DatabaseManager:
                 phys_status = s.get("physical_status") or "Empty"
                 dist = s.get("distance_cm")
                 heartbeat = str(s.get("last_heartbeat") or "")
+                is_healthy_flag = bool(s.get("is_healthy", 1))
+
+                # Check optional heartbeat timeout only if explicitly configured (> 0)
+                hb_dt = parse_datetime_to_kolkata(s.get("last_heartbeat"))
+                is_timed_out = False
+                if hb_dt and SENSOR_TIMEOUT_SECONDS > 0:
+                    elapsed = (now - hb_dt).total_seconds()
+                    if elapsed > SENSOR_TIMEOUT_SECONDS:
+                        is_timed_out = True
+
+                is_sensor_error = (phys_status in ("Error", "Unknown") or not is_healthy_flag or is_timed_out)
+                is_physically_occupied = (phys_status == "Occupied" and not is_sensor_error)
 
                 slot_b_list = bookings_by_slot.get(slot_id, [])
 
@@ -580,14 +726,11 @@ class DatabaseManager:
                 booked_intervals = []
 
                 for b in slot_b_list:
-                    s_raw = b["start_datetime"]
-                    e_raw = b["end_datetime"]
-                    if isinstance(s_raw, str):
-                        s_dt = datetime.strptime(s_raw[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=TIMEZONE)
-                        e_dt = datetime.strptime(e_raw[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=TIMEZONE)
-                    else:
-                        s_dt = s_raw.replace(tzinfo=TIMEZONE)
-                        e_dt = e_raw.replace(tzinfo=TIMEZONE)
+                    s_dt = parse_datetime_to_kolkata(b["start_datetime"])
+                    e_dt = parse_datetime_to_kolkata(b["end_datetime"])
+
+                    if not s_dt or not e_dt:
+                        continue
 
                     b_interval = {
                         "booking_id": b["booking_id"],
@@ -598,6 +741,7 @@ class DatabaseManager:
                     }
                     booked_intervals.append(b_interval)
 
+                    # Active booking: CURRENT TIME falls strictly within booking window
                     if s_dt <= now < e_dt:
                         active_booking = b
                     elif s_dt > now:
@@ -605,48 +749,61 @@ class DatabaseManager:
                         if next_booking is None:
                             next_booking = b
 
-                # Compute effective slot status:
-                # 1. Physically Occupied: Sensor detects vehicle -> 'Occupied'
-                # 2. Active Reservation: Has active reservation covering CURRENT time -> 'Reserved'
-                # 3. Sensor Error: Sensor hardware error or timeout -> 'Sensor Error'
-                # 4. Available: Physically empty and no ACTIVE reservation right now (future bookings do not block current availability!)
-                is_occupied = (phys_status == "Occupied")
                 is_currently_reserved = (active_booking is not None)
+                has_upcoming_reservation = (next_booking is not None)
 
-                if is_occupied:
+                # Available Now: Physically empty, no active reservation right now, and no sensor error!
+                # (Crucial: Future bookings do NOT block current availability!)
+                is_available_now = (not is_physically_occupied and not is_currently_reserved and not is_sensor_error)
+
+                # Effective Display Status:
+                # 1. Occupied: Physical vehicle present (highest priority)
+                # 2. Sensor Error: Hardware error or timeout
+                # 3. Reserved: Active reservation right now and empty
+                # 4. Upcoming Reservation: Has future booking, empty now
+                # 5. Available: Clear, empty, ready for booking
+                if is_physically_occupied:
                     effective_status = "Occupied"
+                elif is_sensor_error:
+                    effective_status = "Sensor Error"
                 elif is_currently_reserved:
                     effective_status = "Reserved"
-                elif phys_status in ("Error", "Unknown"):
-                    effective_status = "Sensor Error"
+                elif has_upcoming_reservation:
+                    effective_status = "Upcoming Reservation"
                 else:
                     effective_status = "Available"
 
                 # Pick latest active or upcoming booking for display
                 display_booking = active_booking or next_booking or (slot_b_list[-1] if slot_b_list else None)
 
-                # Formulate next availability caption
-                if next_booking and not is_currently_reserved:
-                    availability_window = f"Available now until {str(next_booking['start_time'])[:5]}"
+                # Formulate human-readable availability caption
+                if is_sensor_error:
+                    availability_window = "Sensor Error / Disconnected"
+                elif is_physically_occupied:
+                    if is_currently_reserved:
+                        availability_window = f"Occupied (Reserved until {str(active_booking['end_time'])[:5]})"
+                    else:
+                        availability_window = "Occupied by vehicle"
                 elif is_currently_reserved:
                     availability_window = f"Reserved until {str(active_booking['end_time'])[:5]}"
-                elif is_occupied:
-                    availability_window = "Occupied by vehicle"
+                elif has_upcoming_reservation:
+                    availability_window = f"Available now until {str(next_booking['start_time'])[:5]}"
                 else:
-                    availability_window = "Available all day"
+                    availability_window = "Available for booking"
 
                 computed_slots.append({
                     "id": slot_id,
                     "slot_number": s["slot_number"],
                     "status": effective_status,
-                    "physical_status": phys_status,
-                    "is_physically_occupied": is_occupied,
+                    "physical_status": "Error" if is_sensor_error else phys_status,
+                    "is_physically_occupied": is_physically_occupied,
                     "is_currently_reserved": is_currently_reserved,
-                    "has_upcoming_reservation": (next_booking is not None),
-                    "reservation_status": "Active Reservation" if is_currently_reserved else ("Upcoming Reservation" if next_booking else "None"),
-                    "distance_cm": dist,
+                    "has_upcoming_reservation": has_upcoming_reservation,
+                    "is_available_now": is_available_now,
+                    "reservation_status": "Active Reservation" if is_currently_reserved else ("Upcoming Reservation" if has_upcoming_reservation else "None"),
+                    "distance_cm": dist if not is_sensor_error else None,
                     "last_sensor_update": heartbeat,
-                    "is_sensor_healthy": bool(s.get("is_healthy", 1)),
+                    "is_sensor_healthy": not is_sensor_error,
                     "availability_window": availability_window,
                     "booked_intervals": booked_intervals,
                     "active_booking": {
@@ -664,7 +821,17 @@ class DatabaseManager:
                         "duration_minutes": next_booking.get("duration_minutes", 60),
                     } if next_booking else None,
                     "upcoming_count": len(upcoming_bookings_list),
-                    # Backward compatibility fields for existing frontend expectations
+                    "all_upcoming_bookings": [
+                        {
+                            "booking_id": ub["booking_id"],
+                            "date": str(ub["booking_date"]),
+                            "start_time": str(ub["start_time"])[:5],
+                            "end_time": str(ub["end_time"])[:5],
+                            "duration_minutes": ub.get("duration_minutes", 60),
+                        }
+                        for ub in upcoming_bookings_list
+                    ],
+                    # Backward compatibility fields
                     "date": str(display_booking["booking_date"]) if display_booking else None,
                     "start_time": str(display_booking["start_time"])[:5] if display_booking else None,
                     "end_time": str(display_booking["end_time"])[:5] if display_booking else None,
@@ -672,24 +839,27 @@ class DatabaseManager:
                     "booking_id": display_booking["booking_id"] if display_booking else None,
                 })
 
-            # Calculate accurate dashboard summary counts (Independently verified):
+            # Calculate accurate dashboard summary counts (Independently separated):
             total_slots = len(computed_slots)
             physically_occupied = sum(1 for s in computed_slots if s["is_physically_occupied"])
+            physical_available = total_slots - physically_occupied
             booked_reserved = sum(1 for s in computed_slots if s["is_currently_reserved"])
-            available_now = sum(1 for s in computed_slots if s["status"] == "Available")
-            sensor_errors = sum(1 for s in computed_slots if s["physical_status"] in ("Error", "Unknown"))
+            available_now = sum(1 for s in computed_slots if s["is_available_now"])
+            sensor_errors = sum(1 for s in computed_slots if s["status"] == "Sensor Error")
             total_upcoming = sum(s["upcoming_count"] for s in computed_slots)
 
             counts = {
                 "total_slots": total_slots,
-                "available_now": available_now,
+                "physical_available": physical_available,
                 "physically_occupied": physically_occupied,
                 "booked_reserved": booked_reserved,
+                "available_now": available_now,
                 "sensor_errors": sensor_errors,
                 "upcoming_reservations": total_upcoming,
-                # For compatibility with simple cards:
+                # Backward compatibility aliases:
                 "total": total_slots,
-                "available": available_now,
+                "available": physical_available,
+                "physical_occupied": physically_occupied,
                 "occupied": physically_occupied,
                 "reserved": booked_reserved,
             }
