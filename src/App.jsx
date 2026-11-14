@@ -80,7 +80,12 @@ function App() {
       }
 
       const startDt = new Date(y, m - 1, d, Number(startParts[0]), Number(startParts[1]), 0);
-      const endDt = new Date(y, m - 1, d, Number(endParts[0]), Number(endParts[1]), 0);
+      let endDt = new Date(y, m - 1, d, Number(endParts[0]), Number(endParts[1]), 0);
+
+      // Handle midnight crossing where end time is on the next calendar day
+      if (endDt <= startDt) {
+        endDt = new Date(y, m - 1, d + 1, Number(endParts[0]), Number(endParts[1]), 0);
+      }
 
       if (now >= startDt && now < endDt) {
         return "ACTIVE_NOW";
@@ -143,33 +148,48 @@ function App() {
     return () => clearInterval(interval);
   }, [refreshData]);
 
-  // Dashboard KPI Counters: Fully separated metrics per Section 5 & Section 9
+  // Dashboard KPI Counters: Fully separated metrics per Section 2, 3, 5 & 9
   const displaySummary = useMemo(() => {
-    if (!slots || slots.length === 0) return summary;
-
-    const total = slots.length;
-    // Physical Occupied: only bays where sensor detects a vehicle
+    const total = slots.length > 0 ? slots.length : (summary.total_slots || 3);
     const occupied = slots.filter((s) => s.is_physically_occupied).length;
-    // Physical Available: Total Slots - Physical Occupied (Empty bays)
     const physicalAvailable = total - occupied;
-    // Booked / Reserved: bays that have ACTIVE reservations during current time
-    const reserved = slots.filter((s) => s.is_currently_reserved).length;
-    // Sensor Errors: bays whose sensors are in Error state
+
+    // BOOKED / RESERVED KPI (Section 2 Specification):
+    // Number of reservation records that:
+    // - Are confirmed and not cancelled
+    // - Have an end datetime later than current time
+    // - Include BOTH upcoming reservations and currently active reservations
+    // - Exclude cancelled bookings
+    // - Exclude bookings that have already ended
+    let reservedCount = 0;
+    if (bookings && bookings.length > 0) {
+      reservedCount = bookings.filter((b) => {
+        if (b.booking_status === "CANCELLED") return false;
+        const lifeStatus = getBookingLifecycleStatus(b);
+        return lifeStatus === "ACTIVE_NOW" || lifeStatus === "UPCOMING";
+      }).length;
+    } else {
+      reservedCount = summary.booked_reserved || 0;
+    }
+
     const errors = slots.filter(
       (s) => s.status === "Sensor Error" || s.physical_status === "Error"
     ).length;
+
     // Available for Booking: physically empty AND not currently reserved
-    const availableNow = slots.filter((s) => s.is_available_now).length;
+    const availableNow = slots.length > 0
+      ? slots.filter((s) => s.is_available_now).length
+      : (summary.available_now ?? 3);
 
     return {
       total_slots: total,
       physical_available: physicalAvailable,
       physically_occupied: occupied,
-      booked_reserved: reserved,
+      booked_reserved: reservedCount,
       available_now: availableNow,
       sensor_errors: errors,
     };
-  }, [slots, summary]);
+  }, [slots, bookings, summary]);
 
   // Existing active bookings for selected slot on chosen date (handling midnight)
   const slotBookingsOnDate = useMemo(() => {
@@ -291,8 +311,6 @@ function App() {
   }, [selectedSlot, date, slotBookingsOnDate]);
 
   // Client-side conflict check for selected time window + 1-minute buffer
-  // Enforces 1-minute buffer without false rejections:
-  // E.g. Booking 1: 09:00-09:30, Booking 2: 09:31-10:00 is ACCEPTED!
   const conflictWarning = useMemo(() => {
     if (!selectedSlot || !date || !time || !duration) return null;
     if (slotBookingsOnDate.length === 0) return null;
@@ -313,9 +331,7 @@ function App() {
         bEnd = bStart + (Number(b.duration_minutes) || 60);
       }
 
-      // 1-minute buffer check:
-      // Conflict if requested interval overlaps [bStart - 1, bEnd + 1]
-      // That is: reqStart < (bEnd + 1) AND reqEnd > (bStart - 1)
+      // 1-minute safety buffer check
       const bufStart = bStart - 1;
       const bufEnd = bEnd + 1;
 
@@ -370,6 +386,24 @@ function App() {
           `Success! Bay #${selectedSlot} reserved: ${date} from ${time} to ${endTime} (Booking ID: ${data.booking.booking_id}).`
         );
         setSelectedSlot(null);
+
+        // IMMEDIATE SYNCHRONOUS STATE UPDATE
+        if (data.booking) {
+          setBookings((prev) => [
+            data.booking,
+            ...prev.filter((b) => b.booking_id !== data.booking.booking_id),
+          ]);
+        }
+        if (data.summary) {
+          setSummary(data.summary);
+        }
+        if (data.slot) {
+          setSlots((prev) =>
+            prev.map((s) => (s.id === data.slot.id ? data.slot : s))
+          );
+        }
+
+        // Full authoritative background sync
         await refreshData();
       } else {
         setErrorMsg(
@@ -405,6 +439,19 @@ function App() {
         setMessage(
           `Reservation ${bookingId} for Bay #${slotId || ""} was cancelled successfully. That time window is now free!`
         );
+
+        // IMMEDIATE SYNCHRONOUS STATE UPDATE:
+        // Update local booking list to CANCELLED so active table & KPI update instantly
+        setBookings((prev) =>
+          prev.map((b) =>
+            b.booking_id === bookingId ? { ...b, booking_status: "CANCELLED" } : b
+          )
+        );
+        if (data.summary) {
+          setSummary(data.summary);
+        }
+
+        // Full authoritative background sync
         await refreshData();
       } else {
         setErrorMsg(data.detail || data.message || "Failed to cancel booking.");
@@ -439,7 +486,6 @@ function App() {
 
     // Check availability windows
     if (slotBookings.length > 0) {
-      // Find latest end time among bookings
       let maxEndMin = 0;
       for (const b of slotBookings) {
         const eParts = (b.end_time || "").slice(0, 5).split(":").map(Number);
@@ -562,7 +608,7 @@ function App() {
         <div className="kpi-card kpi-orange">
           <div className="kpi-label">Booked / Reserved</div>
           <div className="kpi-value">{displaySummary.booked_reserved}</div>
-          <div className="kpi-subtext">Active reservation right now</div>
+          <div className="kpi-subtext">Active + Upcoming Reservations</div>
         </div>
 
         <div className="kpi-card kpi-blue">

@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date as dt_date
 from typing import Optional, List, Dict, Any
 
 try:
@@ -31,6 +31,43 @@ def is_mysql_configured() -> bool:
 def get_current_time() -> datetime:
     """Returns the current timezone-aware datetime in Asia/Kolkata."""
     return datetime.now(TIMEZONE)
+
+
+def format_time_value(val: Any) -> Optional[str]:
+    """Formats time or timedelta into standard 2-digit zero-padded HH:MM:SS string."""
+    if val is None:
+        return None
+    if isinstance(val, timedelta):
+        total_seconds = int(val.total_seconds())
+        h = (total_seconds // 3600) % 24
+        m = (total_seconds % 3600) // 60
+        s = total_seconds % 60
+        return f"{h:02d}:{m:02d}:{s:02d}"
+    if isinstance(val, datetime):
+        return val.strftime("%H:%M:%S")
+    s = str(val).strip()
+    if not s:
+        return None
+    parts = s.split(":")
+    if len(parts) >= 2:
+        try:
+            h = int(parts[0])
+            m = int(parts[1])
+            sec = int(parts[2].split(".")[0]) if len(parts) > 2 else 0
+            return f"{h:02d}:{m:02d}:{sec:02d}"
+        except ValueError:
+            pass
+    return s
+
+
+def format_date_value(val: Any) -> Optional[str]:
+    """Formats date into standard YYYY-MM-DD string."""
+    if val is None:
+        return None
+    if isinstance(val, (datetime, dt_date)):
+        return val.strftime("%Y-%m-%d")
+    s = str(val).strip()
+    return s[:10] if len(s) >= 10 else s
 
 
 def parse_datetime_to_kolkata(dt_val: Any) -> Optional[datetime]:
@@ -140,7 +177,7 @@ class DatabaseManager:
                 """)
 
                 # Auto-migration: Drop any legacy UNIQUE constraints on bookings table
-                # that would prevent multiple bookings on the same slot_id or slot_id+date
+                # that would prevent multiple sequential bookings on the same slot_id
                 try:
                     cursor.execute("""
                         SELECT DISTINCT INDEX_NAME
@@ -430,9 +467,9 @@ class DatabaseManager:
 
             conn.commit()
             b_dict["booking_status"] = "CANCELLED"
-            for k in ("start_time", "end_time", "booking_date"):
-                if b_dict.get(k) is not None:
-                    b_dict[k] = str(b_dict[k])
+            b_dict["start_time"] = format_time_value(b_dict.get("start_time"))
+            b_dict["end_time"] = format_time_value(b_dict.get("end_time"))
+            b_dict["booking_date"] = format_date_value(b_dict.get("booking_date"))
             return b_dict
         finally:
             cursor.close()
@@ -484,7 +521,7 @@ class DatabaseManager:
             conn.close()
 
     def get_bookings(self, slot_id: int = None, status: str = None):
-        """Retrieves bookings ordered by start_datetime."""
+        """Retrieves bookings ordered by start_datetime with clean serialized date/time fields."""
         conn, db_type = self.get_connection()
         cursor = conn.cursor()
 
@@ -507,7 +544,10 @@ class DatabaseManager:
             results = []
             for r in rows:
                 item = dict(r)
-                for k in ("start_time", "end_time", "start_datetime", "end_datetime", "booking_date", "created_at", "updated_at"):
+                item["start_time"] = format_time_value(item.get("start_time"))
+                item["end_time"] = format_time_value(item.get("end_time"))
+                item["booking_date"] = format_date_value(item.get("booking_date"))
+                for k in ("start_datetime", "end_datetime", "created_at", "updated_at"):
                     if item.get(k) is not None:
                         item[k] = str(item[k])
                 results.append(item)
@@ -526,7 +566,10 @@ class DatabaseManager:
             if not row:
                 return None
             item = dict(row)
-            for k in ("start_time", "end_time", "start_datetime", "end_datetime", "booking_date", "created_at", "updated_at"):
+            item["start_time"] = format_time_value(item.get("start_time"))
+            item["end_time"] = format_time_value(item.get("end_time"))
+            item["booking_date"] = format_date_value(item.get("booking_date"))
+            for k in ("start_datetime", "end_datetime", "created_at", "updated_at"):
                 if item.get(k) is not None:
                     item[k] = str(item[k])
             return item
@@ -667,6 +710,7 @@ class DatabaseManager:
         - Upcoming Reservation: Future reservation exists, bay empty now
         - Sensor Error: Sensor state is 'Error'
         - Available Now / Ready to Book: Neither physically occupied, nor reserved right now, nor sensor error
+        - Booked / Reserved (Section 2 KPI): Total count of active + upcoming confirmed bookings that end after now!
         """
         now = get_current_time()
         conn, _ = self.get_connection()
@@ -690,7 +734,18 @@ class DatabaseManager:
                 WHERE booking_status = 'ACTIVE'
                 ORDER BY start_datetime ASC;
             """)
-            bookings_rows = [dict(r) for r in cursor.fetchall()]
+            raw_bookings_rows = [dict(r) for r in cursor.fetchall()]
+
+            bookings_rows = []
+            for b in raw_bookings_rows:
+                b_item = dict(b)
+                b_item["start_time"] = format_time_value(b_item.get("start_time"))
+                b_item["end_time"] = format_time_value(b_item.get("end_time"))
+                b_item["booking_date"] = format_date_value(b_item.get("booking_date"))
+                for k in ("start_datetime", "end_datetime"):
+                    if b_item.get(k) is not None:
+                        b_item[k] = str(b_item[k])
+                bookings_rows.append(b_item)
 
             bookings_by_slot = {1: [], 2: [], 3: []}
             for b in bookings_rows:
@@ -839,14 +894,24 @@ class DatabaseManager:
                     "booking_id": display_booking["booking_id"] if display_booking else None,
                 })
 
-            # Calculate accurate dashboard summary counts (Independently separated):
+            # Calculate accurate dashboard summary counts:
             total_slots = len(computed_slots)
             physically_occupied = sum(1 for s in computed_slots if s["is_physically_occupied"])
             physical_available = total_slots - physically_occupied
-            booked_reserved = sum(1 for s in computed_slots if s["is_currently_reserved"])
             available_now = sum(1 for s in computed_slots if s["is_available_now"])
             sensor_errors = sum(1 for s in computed_slots if s["status"] == "Sensor Error")
-            total_upcoming = sum(s["upcoming_count"] for s in computed_slots)
+            active_reservations = sum(1 for s in computed_slots if s["is_currently_reserved"])
+            upcoming_reservations = sum(s["upcoming_count"] for s in computed_slots)
+
+            # Section 2 Definition of BOOKED / RESERVED KPI:
+            # Number of confirmed, non-cancelled reservation records that end in the future (end_datetime > now).
+            # Includes BOTH active reservations and upcoming reservations.
+            # Multiple sequential bookings on the same bay are counted separately.
+            active_or_upcoming_bookings = [
+                b for b in bookings_rows
+                if parse_datetime_to_kolkata(b.get("end_datetime")) and parse_datetime_to_kolkata(b.get("end_datetime")) > now
+            ]
+            booked_reserved = len(active_or_upcoming_bookings)
 
             counts = {
                 "total_slots": total_slots,
@@ -855,7 +920,8 @@ class DatabaseManager:
                 "booked_reserved": booked_reserved,
                 "available_now": available_now,
                 "sensor_errors": sensor_errors,
-                "upcoming_reservations": total_upcoming,
+                "active_reservations": active_reservations,
+                "upcoming_reservations": upcoming_reservations,
                 # Backward compatibility aliases:
                 "total": total_slots,
                 "available": physical_available,
